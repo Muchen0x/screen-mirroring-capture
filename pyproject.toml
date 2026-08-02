@@ -1,0 +1,47 @@
+[project]
+name = "screen-mirroring-capture"
+version = "1.0.0"
+description = "Capture live stream URLs via fake screen casting (DLNA / AirPlay / Chromecast)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+dependencies = [
+    "ifaddr>=0.2.0",
+    "zeroconf>=0.131.0",
+    "protobuf>=4.25.0",
+    "cryptography>=41.0.0",
+    "pycryptodome>=3.23.0",
+]
+authors = [{ name = "Muchen" }]
+keywords = [
+    "dlna", "upnp", "airplay", "chromecast",
+    "google-cast", "live-stream", "screen-casting", "video-channel",
+    "stream-capture", "投屏", "直播",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://github.com/Muchen0x/screen-mirroring-capture"
+Repository = "https://github.com/Muchen0x/screen-mirroring-capture"
+Issues = "https://github.com/Muchen0x/screen-mirroring-capture/issues"
+
+[project.scripts]
+screen-mirroring-capture = "screen_mirroring_capture.__main__:main"
+screen-mirroring-capture-gui = "screen_mirroring_capture.gui:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
