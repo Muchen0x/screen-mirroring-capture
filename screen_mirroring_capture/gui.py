@@ -29,9 +29,16 @@ log = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────
 
-CONFIG_DIR = Path.home() / ".screen-mirroring-capture"
+if getattr(sys, "frozen", False):
+    if "_MEI" in str(sys.executable):
+        BASE_DIR = Path(sys.argv[0]).resolve().parent
+    else:
+        BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+CONFIG_DIR = BASE_DIR / "config"
+LOG_DIR = BASE_DIR / "log"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-LOG_DIR = CONFIG_DIR / "logs"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 
 # Format mapping: URL extension -> (default save extension, format name)
@@ -274,7 +281,7 @@ def _get_duration(url: str) -> tuple[float | None, str]:
             ffprobe, "-v", "quiet", "-print_format", "json",
             "-show_format", "-allowed_extensions", "ALL", "-extension_picky", "0", url,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode == 0:
             data = json.loads(result.stdout)
             duration = float(data["format"]["duration"])
@@ -341,7 +348,7 @@ def _get_stream_info(url: str) -> dict:
             "-show_format", "-show_streams", "-allowed_extensions", "ALL",
             "-extension_picky", "0", url,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode == 0:
             return json.loads(result.stdout)
     except Exception:
@@ -1459,7 +1466,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.0.0")
+        self.title("screen-mirroring-capture v1.0.1")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -2037,7 +2044,8 @@ class App(tk.Tk):
         def _run_record():
             try:
                 proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.PIPE, universal_newlines=True, bufsize=1)
+                                        stderr=subprocess.PIPE, universal_newlines=True, bufsize=1,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
                 self._record_proc = proc
                 stderr_lines = []
                 for line in proc.stderr:
