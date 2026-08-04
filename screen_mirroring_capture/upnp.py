@@ -66,6 +66,7 @@ class UPnPHandler(BaseHTTPRequestHandler):
     device_uuid: str = ""
     friendly_name: str = ""
     on_url: Callable[[str], None] | None = None
+    on_play: Callable[[], None] | None = None
     _captured: bool = False
     _subscribers: dict[str, str] = {}
     _subscribers_lock = threading.Lock()
@@ -98,7 +99,7 @@ class UPnPHandler(BaseHTTPRequestHandler):
         if "SetAVTransportURI" in action:
             self._on_set_uri(body)
         elif "GetTransportInfo" in action:
-            state = "STOPPED" if self._captured else "PLAYING"
+            state = "PLAYING" if self._captured else "STOPPED"
             self._xml(
                 200,
                 descriptors.soap_response(
@@ -158,9 +159,15 @@ class UPnPHandler(BaseHTTPRequestHandler):
                     "</Sink>",
                 ),
             )
+        elif "Play" in action:
+            if self.on_play:
+                threading.Thread(target=self.on_play, daemon=True).start()
+            self._xml(200, descriptors.soap_response("Play", "AVTransport"))
+        elif "Stop" in action:
+            self._xml(200, descriptors.soap_response("Stop", "AVTransport"))
         else:
             name = next(
-                (n for n in ("Play", "Stop", "Pause") if n in action),
+                (n for n in ("Pause",) if n in action),
                 "Unknown",
             )
             svc = (
@@ -209,12 +216,11 @@ class UPnPHandler(BaseHTTPRequestHandler):
             UPnPHandler._captured = True
             self.on_url(url)
 
-            # Delay the STOPPED event so the sender stays connected
-            # long enough for the user to see it succeeded.
+            # Notify subscribers that a URI was set (stopped state)
             def _delayed_stop():
                 import time
 
-                time.sleep(3)
+                time.sleep(1)
                 self._notify_stopped()
 
             threading.Thread(target=_delayed_stop, daemon=True).start()

@@ -64,6 +64,7 @@ class AirPlayHandler(BaseHTTPRequestHandler):
     sys_version = ""
 
     on_url: Callable[[str], None] | None = None
+    on_play: Callable[[], None] | None = None
     friendly_name: str = ""
     _captured: bool = False
     _ltsk: ed25519.Ed25519PrivateKey | None = None
@@ -310,6 +311,8 @@ class AirPlayHandler(BaseHTTPRequestHandler):
             log.debug("AirPlay captured URL: %s", url)
             AirPlayHandler._captured = True
             self.on_url(url)
+            if AirPlayHandler.on_play:
+                threading.Thread(target=AirPlayHandler.on_play, daemon=True).start()
 
         self._respond(200, b"")
 
@@ -321,6 +324,8 @@ class AirPlayHandler(BaseHTTPRequestHandler):
                 log.debug("AirPlay action captured URL: %s", url)
                 AirPlayHandler._captured = True
                 self.on_url(url)
+                if AirPlayHandler.on_play:
+                    threading.Thread(target=AirPlayHandler.on_play, daemon=True).start()
         except Exception:
             pass
         self._respond(200, b"")
@@ -374,6 +379,7 @@ class AirPlayReceiver:
         local_ip: str,
         port: int,
         on_url: Callable[[str], None],
+        on_play: Callable[[], None] | None = None,
         audio_output: str | None = None,
         audio_duration: float | None = None,
     ):
@@ -381,6 +387,7 @@ class AirPlayReceiver:
         self._ip = local_ip
         self._port = port
         self._on_url = on_url
+        self._on_play = on_play
         self._audio_output = audio_output
         self._audio_duration = audio_duration
         self._zc: Zeroconf | None = None
@@ -392,6 +399,7 @@ class AirPlayReceiver:
         pk_hex = HapSession(ltsk=ltsk).public_key_hex
 
         AirPlayHandler.on_url = staticmethod(self._on_url)
+        AirPlayHandler.on_play = self._on_play
         AirPlayHandler.friendly_name = self._name
         AirPlayHandler._captured = False
         AirPlayHandler._ltsk = ltsk

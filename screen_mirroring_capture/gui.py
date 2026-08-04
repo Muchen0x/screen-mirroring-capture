@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
-import sys
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -1029,13 +1031,13 @@ class HistoryDialog(tk.Toplevel):
     def _on_double_click(self, event: tk.Event) -> None:
         record = self._get_selected_record()
         if record:
-            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""))
+            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""), from_history=True)
             self.destroy()
 
     def _confirm_and_close(self) -> None:
         record = self._get_selected_record()
         if record:
-            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""))
+            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""), from_history=True)
             self.destroy()
 
     def _on_right_click(self, event: tk.Event) -> None:
@@ -1136,7 +1138,7 @@ class HistoryDialog(tk.Toplevel):
         if not record:
             return
         url = record["url"]
-        self._parent._load_url_to_ui(url, record_history=False, remark=record.get("remark", ""))
+        self._parent._load_url_to_ui(url, record_history=False, remark=record.get("remark", ""), from_history=True)
         save_dir = self._parent._save_dir_var.get().strip()
         dialog = RecordDialog(self._parent, url, save_dir)
         result = dialog.show()
@@ -1466,7 +1468,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.0.1")
+        self.title("screen-mirroring-capture v1.1.0")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -1491,10 +1493,17 @@ class App(tk.Tk):
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._record_proc: subprocess.Popen | None = None
+        self._player_proc: subprocess.Popen | None = None
         self._stream_duration: float | None = None
         self._config = _load_config()
         self._history_loaded = False
         self._current_log_file: Path | None = None
+        self._continuous_var = tk.BooleanVar(value=False)
+        self._capture_count = 0
+        self._playlist_path: Path | None = None
+        self._playlist_urls: list[str] = []
+        self._last_player_name: str = ""
+        self._ipc_pipe: str = ""
 
         self._build_ui()
         self._remove_focus_ring()
@@ -1610,10 +1619,13 @@ class App(tk.Tk):
         self._status_var = tk.StringVar(value="● 已停止")
         self._status_label = ttk.Label(row_ctrl, textvariable=self._status_var, foreground="red")
         self._status_label.pack(side="left", padx=16)
-
+        self._continuous_cb = ttk.Checkbutton(row_ctrl, text="持续捕获", variable=self._continuous_var)
+        self._continuous_cb.pack(side="left")
         row_url = ttk.Frame(frm_capture)
         row_url.pack(fill="x", pady=(8, 0))
-        ttk.Label(row_url, text="URL:").pack(side="left")
+        self._url_prefix_var = tk.StringVar(value="捕获URL:")
+        self._url_prefix_label = tk.Label(row_url, textvariable=self._url_prefix_var, foreground="blue", bg="#e0e0e0")
+        self._url_prefix_label.pack(side="left")
         self._url_var = tk.StringVar()
         self._url_entry = ttk.Entry(row_url, textvariable=self._url_var, state="readonly")
         self._url_entry.pack(side="left", fill="x", expand=True, padx=4)
@@ -1649,6 +1661,19 @@ class App(tk.Tk):
             self._player_buttons[name] = btn
         self._edit_btn = ttk.Button(self._player_buttons_frame, text="编辑", command=self._open_player_dialog)
         self._edit_btn.pack(side="left", padx=(4, 0))
+
+        # Auto-play
+        row_auto = ttk.Frame(frm_capture)
+        row_auto.pack(fill="x", pady=(4, 0))
+        self._auto_play_var = tk.BooleanVar(value=self._config.get("auto_play", False))
+        ttk.Checkbutton(row_auto, text="自动播放:", variable=self._auto_play_var,
+                        command=self._save_auto_play_settings).pack(side="left")
+        player_names = list(self._config.get("players", {}).keys())
+        self._auto_play_player_var = tk.StringVar(value=self._config.get("auto_play_player", ""))
+        self._auto_play_combo = ttk.Combobox(row_auto, textvariable=self._auto_play_player_var,
+                                              values=player_names, width=20, state="readonly")
+        self._auto_play_combo.pack(side="left", padx=(4, 0))
+        self._auto_play_combo.bind("<<ComboboxSelected>>", lambda e: self.after(10, self.focus_set))
 
         # ── 录制 ──
         rec_wrapper = tk.Frame(self, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
@@ -1789,6 +1814,7 @@ class App(tk.Tk):
     def _start(self) -> None:
         self._save_device_settings()
         self._stop_event.clear()
+        self._capture_count = 0
         self._set_running(True)
         protos = [p for p in PROTOCOLS if self._proto_vars[p].get()]
         ports = {p: int(self._port_vars[p].get().strip()) for p in PROTOCOLS}
@@ -1801,6 +1827,7 @@ class App(tk.Tk):
 
     def _stop(self) -> None:
         self._stop_event.set()
+        self._show_status("● 正在停止...", "orange")
 
     def _ask_name_input(self, title: str, prompt: str, default: str = "") -> str | None:
         """Simple dialog to ask for a text input."""
@@ -1862,6 +1889,115 @@ class App(tk.Tk):
         except Exception as exc:
             _show_error(self, "错误", f"启动播放器失败: {exc}")
 
+    def _launch_auto_player(self, player_name: str, url: str) -> None:
+        """Launch or append to the auto-play player."""
+        players = self._config.get("players", {})
+        path_or_cmd = players.get(player_name)
+        if not path_or_cmd:
+            return
+        player_path = _find_player_executable(path_or_cmd)
+        if not player_path:
+            return
+
+        stem = Path(player_path).stem.lower()
+
+        # mpv: try IPC append when same player and alive
+        if "mpv" in stem and self._player_proc and self._player_proc.poll() is None and player_name == self._last_player_name:
+            if self._mpv_ipc_append(url):
+                self._playlist_urls.append(url)
+                self._write_playlist()
+                log.info("自动播放(IPC) %s: %s (#%d)", player_name, url, len(self._playlist_urls))
+                return
+
+        # Always kill old process before starting fresh
+        self._stop_player()
+        if player_name != self._last_player_name:
+            self._playlist_urls.clear()
+            self._ipc_pipe = ""
+
+        self._last_player_name = player_name
+        self._playlist_urls.append(url)
+
+        try:
+            if self._is_playlist_stem(stem):
+                self._write_playlist()
+                if "mpv" in stem:
+                    pipe_name = f"smc-mpv-{os.getpid()}"
+                    self._ipc_pipe = pipe_name
+                    cmd = [player_path, f"--input-ipc-server=\\.\pipe\{pipe_name}", str(self._playlist_path)]
+                else:
+                    cmd = [player_path, str(self._playlist_path)]
+                has_hls = any(u.lower().endswith((".m3u8", ".m3u")) for u in self._playlist_urls)
+                if has_hls:
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+            else:
+                cmd = [player_path, url]
+                if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+
+            self._player_proc = subprocess.Popen(cmd)
+            log.info("自动播放 %s: %s (#%d)", player_name, url, len(self._playlist_urls))
+        except Exception as exc:
+            log.error("自动播放失败: %s", exc)
+
+    @staticmethod
+    def _is_playlist_stem(stem: str) -> bool:
+        return any(x in stem for x in ("vlc", "mpc-hc", "mpc-be", "mpv"))
+
+    def _write_playlist(self) -> None:
+        if self._playlist_path is None:
+            self._playlist_path = Path(tempfile.gettempdir()) / f"smc_playlist_{os.getpid()}.m3u"
+        lines = ["#EXTM3U\n"]
+        for url in self._playlist_urls:
+            lines.append(f"{url}\n")
+        self._playlist_path.write_text("".join(lines), encoding="utf-8")
+
+    def _mpv_ipc_append(self, url: str) -> bool:
+        if not self._ipc_pipe:
+            return False
+        try:
+            import win32file
+            import win32pipe
+            import pywintypes
+            handle = win32file.CreateFile(
+                f"\\\\.\\pipe\\{self._ipc_pipe}",
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0, None, win32file.OPEN_EXISTING, 0, None
+            )
+            data = json.dumps({"command": ["playlist-add", url]}) + "\n"
+            win32file.WriteFile(handle, data.encode("utf-8"))
+            # Read response to prevent pipe buffer from blocking mpv
+            try:
+                mode = win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_NOWAIT
+                win32pipe.SetNamedPipeHandleState(handle, mode, None, None)
+                _, response = win32file.ReadFile(handle, 4096)
+                log.debug("mpv IPC响应: %s", response.decode("utf-8", errors="replace").strip())
+            except Exception:
+                pass
+            win32file.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+
+    def _stop_player(self) -> None:
+        if self._player_proc and self._player_proc.poll() is None:
+            try:
+                self._player_proc.terminate()
+                self._player_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._player_proc.kill()
+                    self._player_proc.wait(timeout=2)
+                except Exception:
+                    pass
+            self._player_proc = None
+            log.info("自动播放进程已终止")
+
+    def _save_auto_play_settings(self) -> None:
+        self._config["auto_play"] = self._auto_play_var.get()
+        self._config["auto_play_player"] = self._auto_play_player_var.get()
+        _save_config(self._config)
+
     def _rebuild_player_buttons(self) -> None:
         """Rebuild the player buttons in the capture card."""
         if not hasattr(self, "_player_buttons_frame"):
@@ -1882,6 +2018,7 @@ class App(tk.Tk):
 
     def _on_players_changed(self) -> None:
         self._rebuild_player_buttons()
+        self._auto_play_combo.configure(values=list(self._config.get("players", {}).keys()))
 
     def _open_player_dialog(self) -> None:
         """Open the player management dialog."""
@@ -1910,11 +2047,13 @@ class App(tk.Tk):
                 airplay_port=ports.get("airplay", 9091), cast_port=ports.get("cast", 8009),
                 protocols=protocols, stop_event=self._stop_event,
                 on_url=lambda u: self.after(0, self._on_url, u),
+                on_play=lambda: self.after(0, self._on_auto_play),
                 audio_output=audio_output, audio_duration=audio_duration,
                 bind_ip=bind_ip or None,
+                continuous=self._continuous_var.get(),
             )
             if url is None:
-                self.after(0, self._show_status, "● 已停止", "red")
+                pass
         except Exception as exc:
             log.error("捕获失败: %s", exc)
             self.after(0, self._show_status, f"错误: {exc}", "red")
@@ -1923,14 +2062,32 @@ class App(tk.Tk):
 
     def _on_url(self, url: str) -> None:
         self._load_url_to_ui(url)
+        if self._continuous_var.get():
+            self._capture_count += 1
+            self._show_status(f"● 持续捕获中 ({self._capture_count})", "green")
 
-    def _load_url_to_ui(self, url: str, record_history: bool = True, remark: str = "") -> None:
+    def _on_auto_play(self) -> None:
+        if not self._auto_play_var.get():
+            return
+        player_name = self._auto_play_player_var.get()
+        url = self._url_var.get()
+        if not player_name or not url:
+            return
+        self._launch_auto_player(player_name, url)
+
+    def _load_url_to_ui(self, url: str, record_history: bool = True, remark: str = "", from_history: bool = False) -> None:
         """Load a URL into the capture card UI."""
         self._url_var.set(url)
         self._info_var.set("获取流信息中...")
         self._remark_var.set(remark)
         self._update_remark_mode()
-        self._show_status("● 已捕获", "blue")
+        if from_history:
+            self._url_prefix_var.set("历史URL:")
+            self._url_prefix_label.configure(foreground="green")
+        else:
+            self._url_prefix_var.set("捕获URL:")
+            self._url_prefix_label.configure(foreground="blue")
+            self._show_status("● 已捕获", "blue")
         self._rec_status_var.set("")
         self._rec_btn.configure(state="normal")
         for btn in self._player_buttons.values():
@@ -2123,6 +2280,7 @@ class App(tk.Tk):
                 self._proto_checkbuttons[proto].configure(state="disabled")
                 self._port_entries[proto].configure(state="disabled")
             self._restore_btn.configure(state="disabled")
+            self._continuous_cb.configure(state="disabled")
         else:
             self._start_btn.configure(state="normal")
             self._stop_btn.configure(state="disabled")
@@ -2133,6 +2291,12 @@ class App(tk.Tk):
                 self._proto_checkbuttons[proto].configure(state="normal")
                 self._port_entries[proto].configure(state="normal")
             self._restore_btn.configure(state="normal")
+            self._continuous_cb.configure(state="normal")
+            cnt = self._capture_count
+            if cnt and self._continuous_var.get():
+                self._show_status(f"● 已停止 (共捕获 {cnt} 个)", "red")
+            else:
+                self._show_status("● 已停止", "red")
 
     def _show_status(self, text: str, color: str) -> None:
         self._status_var.set(text)

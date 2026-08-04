@@ -46,11 +46,13 @@ def capture(
     airplay_port: int | None = None,
     cast_port: int = 8009,
     on_url: Callable[[str], None] | None = None,
+    on_play: Callable[[], None] | None = None,
     protocols: list[str] | None = None,
     audio_output: str | None = None,
     audio_duration: float | None = None,
     stop_event: threading.Event | None = None,
     bind_ip: str | None = None,
+    continuous: bool = False,
 ) -> str | None:
     """Start fake casting receivers and block until a URL is captured.
 
@@ -60,12 +62,17 @@ def capture(
         airplay_port: AirPlay port. If None, uses port+1 when DLNA is enabled, otherwise uses port.
         cast_port: Google Cast port (default: 8009).
         on_url: Optional callback fired when a URL is captured.
+        on_play: Optional callback fired when a Play command is received.
         protocols: List of protocols to enable. Defaults to all:
                    ``["dlna", "airplay", "cast"]``.
+        audio_output: Directory to save AirPlay audio capture.
+        audio_duration: Max audio capture duration in seconds.
         stop_event: Optional threading.Event. When set, the function
                     stops waiting and returns ``None``.
         bind_ip: Optional IP address to bind services to. When set,
                  overrides auto-detection via ``get_lan_ip()``.
+        continuous: If True, keep waiting after each URL capture until
+                    stop_event is set. Calls on_url for each URL.
 
     Returns:
         The captured stream/video URL, or ``None`` if stopped early.
@@ -83,9 +90,10 @@ def capture(
     event = threading.Event()
 
     def _handle(url: str) -> None:
-        if result:
+        if not continuous and result:
             return
-        result.append(url)
+        if not continuous:
+            result.append(url)
         if on_url:
             on_url(url)
         event.set()
@@ -99,6 +107,8 @@ def capture(
             UPnPHandler.device_uuid = dev_uuid
             UPnPHandler.friendly_name = name
             UPnPHandler.on_url = staticmethod(_handle)
+            UPnPHandler.on_play = staticmethod(on_play)
+            UPnPHandler._captured = False
 
             server = HTTPServer(("", port), UPnPHandler)
             ssdp = SSDPAdvertiser(dev_uuid, location, local_ip)
@@ -122,6 +132,7 @@ def capture(
                 local_ip,
                 ap_port,
                 _handle,
+                on_play=on_play,
                 audio_output=audio_output,
                 audio_duration=audio_duration,
             )
@@ -140,7 +151,7 @@ def capture(
             from .cast import CastReceiver
 
             cp_port = cast_port
-            cast_recv = CastReceiver(name, local_ip, cp_port, _handle)
+            cast_recv = CastReceiver(name, local_ip, cp_port, _handle, on_play=on_play)
             cast_recv.start()
             cleanups.append(cast_recv.stop)
             started.append("cast")
@@ -158,9 +169,12 @@ def capture(
 
     try:
         if stop_event is not None:
-            while not event.is_set():
-                if stop_event.wait(timeout=0.2):
-                    break
+            while not stop_event.is_set():
+                if event.wait(timeout=0.2):
+                    if continuous:
+                        event.clear()
+                    else:
+                        break
         else:
             event.wait()
     except KeyboardInterrupt:
@@ -174,4 +188,4 @@ def capture(
 
     if not result:
         return None
-    return result[0]
+    return result[0] if not continuous else (result[-1] if result else None)

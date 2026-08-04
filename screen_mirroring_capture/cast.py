@@ -112,11 +112,13 @@ class CastReceiver:
         local_ip: str,
         port: int,
         on_url: Callable[[str], None],
+        on_play: Callable[[], None] | None = None,
     ):
         self._name = friendly_name
         self._ip = local_ip
         self._port = port
         self._on_url = on_url
+        self._on_play = on_play
         self._zc: Zeroconf | None = None
         self._info: ServiceInfo | None = None
         self._stop_event = threading.Event()
@@ -290,6 +292,8 @@ class CastReceiver:
             if url:
                 log.debug("Cast captured URL: %s", url)
                 self._on_url(url)
+                if self._on_play:
+                    threading.Thread(target=self._on_play, daemon=True).start()
             # Respond with IDLE/FINISHED so the sender exits casting UI.
             resp = json.dumps(
                 {
