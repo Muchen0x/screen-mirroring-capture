@@ -9,7 +9,7 @@ import signal
 import subprocess
 import sys
 
-from . import PROTOCOLS, capture
+from screen_mirroring_capture import PROTOCOLS, capture
 
 
 def main() -> None:
@@ -71,7 +71,7 @@ examples:
     args = parser.parse_args()
 
     if args.gui:
-        from .gui import run
+        from screen_mirroring_capture.gui import run
 
         run()
         return

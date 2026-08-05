@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -79,15 +80,37 @@ _FORMAT_OPTIONS = [
     (".flac", "FLAC"),
 ]
 
-def _find_player_executable(path_or_cmd: str) -> str | None:
+def _get_player_path(entry: str | dict) -> str:
+    if isinstance(entry, dict):
+        return entry.get("path", "")
+    return entry
+
+
+def _get_player_protocol(entry: str | dict) -> str:
+    if isinstance(entry, dict):
+        return entry.get("protocol", "auto")
+    return "auto"
+
+
+def _get_player_manual_protocol(entry: str | dict) -> str:
+    if isinstance(entry, dict):
+        return entry.get("manual_protocol", "auto")
+    return "auto"
+
+
+def _find_player_executable(path_or_cmd: str | dict) -> str | None:
     """Find a player executable by command name or full path.
 
     Args:
-        path_or_cmd: A command name (e.g. "vlc") or full path.
+        path_or_cmd: A command name (e.g. "vlc"), full path, or dict with "path" key.
 
     Returns:
         Full path to the executable, or None if not found.
     """
+    if isinstance(path_or_cmd, dict):
+        path_or_cmd = path_or_cmd.get("path", "")
+    if not path_or_cmd:
+        return None
     # Check if it's a full path that exists
     p = Path(path_or_cmd)
     if p.is_absolute() and p.exists():
@@ -1210,8 +1233,8 @@ class PlayerDialog(tk.Toplevel):
 
     def _refresh_list(self) -> None:
         self._listbox.delete(0, tk.END)
-        for name, path in self._players.items():
-            self._listbox.insert(tk.END, f"{name}  —  {path}")
+        for name, entry in self._players.items():
+            self._listbox.insert(tk.END, f"{name}  —  {_get_player_path(entry)}")
         if self._listbox.size() > 0:
             self._listbox.selection_set(0)
             self._on_select()
@@ -1238,10 +1261,78 @@ class PlayerDialog(tk.Toplevel):
         name = self._parent._ask_name_input("播放器名称", "请输入播放器显示名称：", Path(path).stem)
         if not name:
             return
-        self._players[name] = path
+        protocol, manual_protocol = self._ask_protocol_input(name)
+        self._players[name] = {"path": path, "protocol": protocol, "manual_protocol": manual_protocol}
         _save_config(self._parent._config)
         self._refresh_list()
         self._on_change()
+
+    def _ask_protocol_input(self, player_name: str) -> tuple[str, str]:
+        dialog = tk.Toplevel(self)
+        dialog.title(f"选择协议 - {player_name}")
+        dialog.minsize(360, 280)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_x(), self.winfo_y()
+        dw, dh = 400, 280
+        dialog.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+        vals = ["auto", "direct", "playlist", "ipc"]
+        desc = {
+            "auto": "自动检测（按程序名判断）",
+            "direct": "直接URL（每次播最新，杀旧重启）",
+            "playlist": "播放列表（.m3u 累积所有URL重启）",
+            "ipc": "IPC追加（命名管道，需mpv支持）",
+        }
+        desc_manual = {
+            "auto": "自动检测（按程序名判断）",
+            "direct": "直接URL（每次开新窗口）",
+            "playlist": "播放列表（临时.m3u，每次开新窗口）",
+            "ipc": "IPC追加（连接已有管道，失败回退direct）",
+        }
+
+        ttk.Label(dialog, text="自动播放协议:").pack(anchor="w", padx=16, pady=(12, 2))
+        protocol_var = tk.StringVar(value="auto")
+        combo = ttk.Combobox(dialog, textvariable=protocol_var, values=vals, state="readonly", width=30)
+        combo.pack(fill="x", padx=16, pady=(0, 2))
+        desc_var = tk.StringVar(value=desc["auto"])
+        ttk.Label(dialog, textvariable=desc_var, foreground="gray", wraplength=360).pack(fill="x", padx=16)
+
+        ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=16, pady=(12, 2))
+        manual_var = tk.StringVar(value="auto")
+        combo_manual = ttk.Combobox(dialog, textvariable=manual_var, values=vals, state="readonly", width=30)
+        combo_manual.pack(fill="x", padx=16, pady=(0, 2))
+        desc_manual_var = tk.StringVar(value=desc_manual["auto"])
+        ttk.Label(dialog, textvariable=desc_manual_var, foreground="gray", wraplength=360).pack(fill="x", padx=16)
+
+        def on_select(_e=None):
+            desc_var.set(desc.get(protocol_var.get(), ""))
+
+        def on_select_manual(_e=None):
+            desc_manual_var.set(desc_manual.get(manual_var.get(), ""))
+
+        combo.bind("<<ComboboxSelected>>", on_select)
+        combo_manual.bind("<<ComboboxSelected>>", on_select_manual)
+
+        result = {"protocol": "auto", "manual_protocol": "auto"}
+
+        def confirm():
+            result["protocol"] = protocol_var.get()
+            result["manual_protocol"] = manual_var.get()
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=(10, 10))
+        ttk.Button(btn_frame, text="确定", command=confirm).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="取消", command=cancel).pack(side="left", padx=4)
+
+        self.wait_window(dialog)
+        return result["protocol"], result["manual_protocol"]
 
     def _remove(self) -> None:
         sel = self._listbox.curselection()
@@ -1267,17 +1358,20 @@ class PlayerDialog(tk.Toplevel):
             return
         text = self._listbox.get(sel[0])
         old_name = text.split("  —  ", 1)[0]
-        old_path = self._players.get(old_name, "")
+        old_entry = self._players.get(old_name, "")
+        old_path = _get_player_path(old_entry)
+        old_protocol = _get_player_protocol(old_entry)
+        old_manual = _get_player_manual_protocol(old_entry)
 
         dialog = tk.Toplevel(self)
         dialog.title("编辑播放器")
-        dialog.minsize(420, 180)
+        dialog.minsize(420, 340)
         dialog.resizable(True, True)
         dialog.grab_set()
         dialog.update_idletasks()
         pw, ph = self.winfo_width(), self.winfo_height()
         px, py = self.winfo_x(), self.winfo_y()
-        dw, dh = 460, 200
+        dw, dh = 460, 360
         dialog.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
 
         ttk.Label(dialog, text="播放器名称:").pack(anchor="w", padx=10, pady=(10, 2))
@@ -1305,6 +1399,20 @@ class PlayerDialog(tk.Toplevel):
 
         ttk.Button(row_path, text="浏览...", command=browse_path).pack(side="left", padx=(4, 0))
 
+        ttk.Label(dialog, text="自动播放协议:").pack(anchor="w", padx=10, pady=(8, 2))
+        protocol_var = tk.StringVar(value=old_protocol)
+        protocol_combo = ttk.Combobox(dialog, textvariable=protocol_var,
+                                       values=["auto", "direct", "playlist", "ipc"],
+                                       state="readonly")
+        protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
+
+        ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(8, 2))
+        manual_var = tk.StringVar(value=old_manual)
+        manual_combo = ttk.Combobox(dialog, textvariable=manual_var,
+                                     values=["auto", "direct", "playlist", "ipc"],
+                                     state="readonly")
+        manual_combo.pack(fill="x", padx=10, pady=(0, 2))
+
         result = {"ok": False}
         def confirm():
             new_name = name_var.get().strip()
@@ -1315,6 +1423,8 @@ class PlayerDialog(tk.Toplevel):
             result["ok"] = True
             result["name"] = new_name
             result["path"] = new_path
+            result["protocol"] = protocol_var.get()
+            result["manual_protocol"] = manual_var.get()
             dialog.destroy()
 
         def cancel():
@@ -1332,8 +1442,10 @@ class PlayerDialog(tk.Toplevel):
 
         new_name = result["name"]
         new_path = result["path"]
+        new_protocol = result.get("protocol", "auto")
+        new_manual = result.get("manual_protocol", "auto")
         del self._players[old_name]
-        self._players[new_name] = new_path
+        self._players[new_name] = {"path": new_path, "protocol": new_protocol, "manual_protocol": new_manual}
         _save_config(self._parent._config)
         self._refresh_list()
         self._on_change()
@@ -1468,7 +1580,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.1.0")
+        self.title("screen-mirroring-capture v1.2.0")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -1504,6 +1616,9 @@ class App(tk.Tk):
         self._playlist_urls: list[str] = []
         self._last_player_name: str = ""
         self._ipc_pipe: str = ""
+        self._last_manual_click_time: float = 0.0
+        self._manual_player_procs: list[subprocess.Popen] = []
+        self._manual_kill_prev_var = tk.BooleanVar(value=self._config.get("manual_kill_prev", False))
 
         self._build_ui()
         self._remove_focus_ring()
@@ -1674,6 +1789,15 @@ class App(tk.Tk):
                                               values=player_names, width=20, state="readonly")
         self._auto_play_combo.pack(side="left", padx=(4, 0))
         self._auto_play_combo.bind("<<ComboboxSelected>>", lambda e: self.after(10, self.focus_set))
+        ttk.Checkbutton(row_auto, text="杀旧进程", variable=self._manual_kill_prev_var,
+                        command=self._save_manual_kill_settings).pack(side="left", padx=(12, 0))
+        ttk.Label(row_auto, text="防抖(秒):").pack(side="left", padx=(12, 2))
+        self._debounce_var = tk.DoubleVar(value=self._config.get("manual_click_debounce", 2.0))
+        debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
+                                     textvariable=self._debounce_var, width=5,
+                                     command=self._save_debounce_settings)
+        debounce_spin.pack(side="left")
+        debounce_spin.bind("<FocusOut>", lambda e: self._save_debounce_settings())
 
         # ── 录制 ──
         rec_wrapper = tk.Frame(self, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
@@ -1868,46 +1992,122 @@ class App(tk.Tk):
 
     def _open_in_player(self, player_name: str, url: str | None = None) -> None:
         """Open captured URL in a specific player by name."""
+        now = time.monotonic()
+        debounce = self._config.get("manual_click_debounce", 2.0)
+        if now - self._last_manual_click_time < debounce:
+            return
+        self._last_manual_click_time = now
         url = url or self._url_var.get()
         if not url:
             return
         players = self._config.get("players", {})
-        path_or_cmd = players.get(player_name)
-        if not path_or_cmd:
+        entry = players.get(player_name)
+        if not entry:
             _show_warning(self, "提示", f"播放器 {player_name} 未配置")
             return
+        path_or_cmd = _get_player_path(entry)
         player_path = _find_player_executable(path_or_cmd)
         if not player_path:
             _show_warning(self, "提示", f"未找到 {player_name} ({path_or_cmd})，请检查路径或重新添加")
             return
-        try:
-            cmd = [player_path, url]
-            if "ffplay" in Path(player_path).stem.lower() and url.lower().endswith((".m3u8", ".m3u")):
-                cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
-            subprocess.Popen(cmd)
-            log.info("用 %s 打开: %s", player_name, url)
-        except Exception as exc:
-            _show_error(self, "错误", f"启动播放器失败: {exc}")
+        if not self._launch_manual_player(player_name, url):
+            _show_error(self, "错误", f"启动播放器 {player_name} 失败")
 
-    def _launch_auto_player(self, player_name: str, url: str) -> None:
-        """Launch or append to the auto-play player."""
+    def _launch_manual_player(self, player_name: str, url: str) -> bool:
+        """Launch player for manual click. Returns True on success.
+        Does NOT kill old processes and does NOT manage auto-play state."""
         players = self._config.get("players", {})
-        path_or_cmd = players.get(player_name)
-        if not path_or_cmd:
-            return
+        entry = players.get(player_name)
+        if not entry:
+            return False
+        path_or_cmd = _get_player_path(entry)
+        protocol = _get_player_manual_protocol(entry)
         player_path = _find_player_executable(path_or_cmd)
         if not player_path:
-            return
+            return False
+
+        # Kill previous player if configured
+        if self._manual_kill_prev_var.get():
+            self._stop_player()
+            for proc in self._manual_player_procs:
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            self._manual_player_procs.clear()
 
         stem = Path(player_path).stem.lower()
 
-        # mpv: try IPC append when same player and alive
-        if "mpv" in stem and self._player_proc and self._player_proc.poll() is None and player_name == self._last_player_name:
+        # Resolve protocol
+        if protocol == "auto":
+            is_playlist = self._is_playlist_stem(stem)
+        elif protocol in ("playlist", "ipc"):
+            is_playlist = True
+        else:
+            is_playlist = False
+
+        # IPC: try append to existing pipe
+        if protocol == "ipc" and "mpv" in stem and self._ipc_pipe:
             if self._mpv_ipc_append(url):
+                log.info("手动播放(IPC) %s: %s", player_name, url)
+                return True
+
+        try:
+            if is_playlist:
+                playlist_path = Path(tempfile.gettempdir()) / f"smc_manual_{os.getpid()}_{id(url)}.m3u"
+                playlist_path.write_text(f"#EXTM3U\n{url}\n", encoding="utf-8")
+                if "mpv" in stem:
+                    pipe_name = f"smc-mpv-manual-{os.getpid()}-{id(url)}"
+                    cmd = [player_path, f"--input-ipc-server=\\.\pipe\{pipe_name}", str(playlist_path)]
+                else:
+                    cmd = [player_path, str(playlist_path)]
+                if url.lower().endswith((".m3u8", ".m3u")):
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+            else:
+                cmd = [player_path, url]
+                if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+
+            proc = subprocess.Popen(cmd)
+            self._manual_player_procs.append(proc)
+            log.info("手动播放 %s: %s", player_name, url)
+            return True
+        except Exception as exc:
+            log.error("手动播放失败: %s", exc)
+            return False
+
+    def _launch_auto_player(self, player_name: str, url: str) -> bool:
+        """Launch or append to the auto-play player. Returns True on success."""
+        players = self._config.get("players", {})
+        entry = players.get(player_name)
+        if not entry:
+            return False
+        path_or_cmd = _get_player_path(entry)
+        protocol = _get_player_protocol(entry)
+        player_path = _find_player_executable(path_or_cmd)
+        if not player_path:
+            return False
+
+        stem = Path(player_path).stem.lower()
+
+        # Resolve protocol
+        if protocol == "auto":
+            is_playlist = self._is_playlist_stem(stem)
+        elif protocol in ("playlist", "ipc"):
+            is_playlist = True
+        else:
+            is_playlist = False
+
+        # IPC: try append when same player and alive
+        if protocol == "ipc" and "mpv" in stem and self._player_proc and self._player_proc.poll() is None and player_name == self._last_player_name:
+            if self._mpv_ipc_append(url):
+                self._playlist_urls.clear()
                 self._playlist_urls.append(url)
                 self._write_playlist()
-                log.info("自动播放(IPC) %s: %s (#%d)", player_name, url, len(self._playlist_urls))
-                return
+                log.info("自动播放(IPC) %s: %s", player_name, url)
+                return True
 
         # Always kill old process before starting fresh
         self._stop_player()
@@ -1919,7 +2119,7 @@ class App(tk.Tk):
         self._playlist_urls.append(url)
 
         try:
-            if self._is_playlist_stem(stem):
+            if is_playlist:
                 self._write_playlist()
                 if "mpv" in stem:
                     pipe_name = f"smc-mpv-{os.getpid()}"
@@ -1936,9 +2136,11 @@ class App(tk.Tk):
                     cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
             self._player_proc = subprocess.Popen(cmd)
-            log.info("自动播放 %s: %s (#%d)", player_name, url, len(self._playlist_urls))
+            log.info("自动播放 %s: %s", player_name, url)
+            return True
         except Exception as exc:
             log.error("自动播放失败: %s", exc)
+            return False
 
     @staticmethod
     def _is_playlist_stem(stem: str) -> bool:
@@ -1964,7 +2166,7 @@ class App(tk.Tk):
                 win32file.GENERIC_READ | win32file.GENERIC_WRITE,
                 0, None, win32file.OPEN_EXISTING, 0, None
             )
-            data = json.dumps({"command": ["playlist-add", url]}) + "\n"
+            data = json.dumps({"command": ["loadfile", url]}) + "\n"
             win32file.WriteFile(handle, data.encode("utf-8"))
             # Read response to prevent pipe buffer from blocking mpv
             try:
@@ -1996,6 +2198,25 @@ class App(tk.Tk):
     def _save_auto_play_settings(self) -> None:
         self._config["auto_play"] = self._auto_play_var.get()
         self._config["auto_play_player"] = self._auto_play_player_var.get()
+        _save_config(self._config)
+        if self._auto_play_var.get():
+            player_name = self._auto_play_player_var.get()
+            url = self._url_var.get()
+            if player_name and url:
+                self._launch_auto_player(player_name, url)
+
+    def _save_debounce_settings(self) -> None:
+        try:
+            val = self._debounce_var.get()
+            val = max(0.5, min(10.0, val))
+            self._debounce_var.set(val)
+            self._config["manual_click_debounce"] = val
+            _save_config(self._config)
+        except Exception:
+            pass
+
+    def _save_manual_kill_settings(self) -> None:
+        self._config["manual_kill_prev"] = self._manual_kill_prev_var.get()
         _save_config(self._config)
 
     def _rebuild_player_buttons(self) -> None:
