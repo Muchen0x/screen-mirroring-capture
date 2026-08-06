@@ -1580,7 +1580,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.2.0")
+        self.title("screen-mirroring-capture v1.3.0")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -1592,7 +1592,7 @@ class App(tk.Tk):
         except Exception:
             pass
         self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
-        self.geometry("690x560")
+        self.geometry("690x610")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         style = ttk.Style()
@@ -1619,6 +1619,7 @@ class App(tk.Tk):
         self._last_manual_click_time: float = 0.0
         self._manual_player_procs: list[subprocess.Popen] = []
         self._manual_kill_prev_var = tk.BooleanVar(value=self._config.get("manual_kill_prev", False))
+        self._log_tab: str = "current"
 
         self._build_ui()
         self._remove_focus_ring()
@@ -1644,21 +1645,61 @@ class App(tk.Tk):
     def _build_ui(self) -> None:
         pad = dict(padx=8, pady=4)
 
+        # ── 可滚动面板 ──
+        self._paned = tk.PanedWindow(self, orient="vertical", sashwidth=8, sashrelief="ridge", bg="#e0e0e0")
+        self._paned.pack(fill="both", expand=True)
+
+        top_frame = ttk.Frame(self._paned)
+        self._content_canvas = tk.Canvas(top_frame, highlightthickness=0, bd=0)
+        self._content_scrollbar = ttk.Scrollbar(top_frame, orient="vertical", command=self._content_canvas.yview)
+        self._content_canvas.configure(yscrollcommand=self._content_scrollbar.set)
+        self._content_frame = ttk.Frame(self._content_canvas)
+        self._content_window = self._content_canvas.create_window((0, 0), window=self._content_frame, anchor="nw")
+
+        def _on_content_configure(event):
+            self._content_canvas.configure(scrollregion=self._content_canvas.bbox("all"))
+        self._content_frame.bind("<Configure>", _on_content_configure)
+
+        def _on_canvas_configure(event):
+            self._content_canvas.itemconfig(self._content_window, width=event.width)
+        self._content_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            x, y = self.winfo_pointerxy()
+            w = self.winfo_containing(x, y)
+            if isinstance(w, (tk.Text, ttk.Spinbox, ttk.Combobox)):
+                return
+            cx = self._content_canvas.winfo_rootx()
+            cy = self._content_canvas.winfo_rooty()
+            cw = self._content_canvas.winfo_width()
+            ch = self._content_canvas.winfo_height()
+            if cx <= x <= cx + cw and cy <= y <= cy + ch:
+                self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.bind_all("<MouseWheel>", _on_mousewheel)
+
+        self._content_scrollbar.pack(side="right", fill="y")
+        self._content_canvas.pack(side="left", fill="both", expand=True)
+        self._content_canvas.bind("<Button-1>", lambda e: self.focus_set())
+        self._content_frame.bind("<Button-1>", lambda e: self.focus_set())
+        self._paned.add(top_frame, stretch="always")
+
         # ── 设备设置 ──
-        dev_wrapper = tk.Frame(self, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
+        dev_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         dev_wrapper.pack(fill="x", **pad)
         frm_dev = ttk.LabelFrame(dev_wrapper, text="设备设置", padding=8)
         frm_dev.pack(fill="x", expand=True)
 
         row1 = ttk.Frame(frm_dev)
         row1.pack(fill="x")
-        ttk.Label(row1, text="设备名称:").pack(side="left")
+        row1.columnconfigure(1, weight=1)
+        row1.columnconfigure(3, weight=1)
+        ttk.Label(row1, text="设备名称:").grid(row=0, column=0, sticky="w")
         self._name_var = tk.StringVar(value=self._config.get("device_name", "screen-mirroring-capture"))
-        self._name_entry = ttk.Entry(row1, textvariable=self._name_var, width=30)
-        self._name_entry.pack(side="left", padx=(4, 16))
+        self._name_entry = ttk.Entry(row1, textvariable=self._name_var)
+        self._name_entry.grid(row=0, column=1, sticky="ew", padx=(4, 16))
         self._name_entry.bind("<FocusOut>", lambda e: self._save_device_settings())
 
-        ttk.Label(row1, text="网络:").pack(side="left")
+        ttk.Label(row1, text="网络:").grid(row=0, column=2, sticky="w")
         self._bind_ip_var = tk.StringVar(value=self._config.get("bind_ip", ""))
         adapters = list_adapters()
         adapter_options = ["自动检测"]
@@ -1669,7 +1710,7 @@ class App(tk.Tk):
             self._adapter_map[label] = ip
         self._net_combo = ttk.Combobox(
             row1, textvariable=self._bind_ip_var, values=adapter_options,
-            width=36, state="readonly",
+            state="readonly",
         )
         # Restore selection from config
         saved_ip = self._config.get("bind_ip", "")
@@ -1682,7 +1723,7 @@ class App(tk.Tk):
                 self._bind_ip_var.set("自动检测")
         else:
             self._bind_ip_var.set("自动检测")
-        self._net_combo.pack(side="left", padx=(4, 0))
+        self._net_combo.grid(row=0, column=3, sticky="ew", padx=(4, 0))
         self._net_combo.bind("<<ComboboxSelected>>", lambda e: (self._save_device_settings(), self._net_tt.hide(), self.focus()))
         self._net_tt = ToolTip(self._net_combo, lambda: self._bind_ip_var.get())
         self._net_combo.bind("<Button-1>", lambda e: self._net_tt.hide(), add="+")
@@ -1719,7 +1760,7 @@ class App(tk.Tk):
         self._verbose_var = tk.BooleanVar(value=self._config.get("verbose", False))
 
         # ── 捕获 ──
-        capture_wrapper = tk.Frame(self, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
+        capture_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         capture_wrapper.pack(fill="x", **pad)
         frm_capture = ttk.LabelFrame(capture_wrapper, text="捕获", padding=8)
         frm_capture.pack(fill="x", expand=True)
@@ -1800,7 +1841,7 @@ class App(tk.Tk):
         debounce_spin.bind("<FocusOut>", lambda e: self._save_debounce_settings())
 
         # ── 录制 ──
-        rec_wrapper = tk.Frame(self, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
+        rec_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         rec_wrapper.pack(fill="x", **pad)
         frm_rec = ttk.LabelFrame(rec_wrapper, text="录制", padding=8)
         frm_rec.pack(fill="x", expand=True)
@@ -1843,36 +1884,52 @@ class App(tk.Tk):
         self._progress_bar.pack(fill="x", pady=(2, 0))
 
         # ── 日志 ──
-        log_wrapper = tk.Frame(self, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
+        log_inner = ttk.Frame(self._paned)
+        log_inner.pack_propagate(False)
+        log_inner.configure(height=125)
+        self._paned.add(log_inner, minsize=70, stretch="never")
+        tk.Frame(log_inner, height=3, bg="#888").pack(fill="x", pady=(0, 4))
+
+        # Bottom toolbar (outside log_wrapper, always visible)
+        row_bottom = ttk.Frame(log_inner)
+        row_bottom.pack(side="bottom", fill="x", **pad)
+        self._log_tab_var = tk.StringVar(value="current")
+        self._log_current_rb = ttk.Radiobutton(row_bottom, text="当前日志",
+                                                variable=self._log_tab_var, value="current",
+                                                command=self._switch_log_tab)
+        self._log_current_rb.pack(side="left", padx=2)
+        self._log_history_rb = ttk.Radiobutton(row_bottom, text="历史日志",
+                                                variable=self._log_tab_var, value="history",
+                                                command=self._switch_log_tab)
+        self._log_history_rb.pack(side="left", padx=2)
+        self._verbose_cb = ttk.Checkbutton(row_bottom, text="启用调试日志",
+                                            variable=self._verbose_var, command=self._on_verbose_change)
+        self._verbose_cb.pack(side="left", padx=(12, 2))
+        self._clear_btn = ttk.Button(row_bottom, text="清除当前日志", command=self._clear_log)
+        self._clear_btn.pack(side="right", padx=2)
+
+        log_wrapper = tk.Frame(log_inner, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         log_wrapper.pack(fill="both", expand=True, **pad)
         frm_log = ttk.LabelFrame(log_wrapper, text="日志", padding=8)
         frm_log.pack(fill="both", expand=True)
 
-        row_log = ttk.Frame(frm_log)
-        row_log.pack(fill="x")
-        self._verbose_cb = ttk.Checkbutton(row_log, text="启用调试日志", variable=self._verbose_var, command=self._on_verbose_change)
-        self._verbose_cb.pack(side="left", padx=2)
-        self._clear_btn = ttk.Button(row_log, text="清除当前日志", command=self._clear_log)
-        self._clear_btn.pack(side="right", padx=2)
+        # Log text container
+        self._log_container = ttk.Frame(frm_log)
+        self._log_container.pack(fill="both", expand=True)
 
-        # Notebook for current / history logs
-        self._notebook = ttk.Notebook(frm_log)
-        self._notebook.pack(fill="both", expand=True)
-        self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-
-        self._current_log_frame = ttk.Frame(self._notebook)
-        self._notebook.add(self._current_log_frame, text="当前日志")
-
+        self._current_log_frame = ttk.Frame(self._log_container)
         self._log_text = tk.Text(self._current_log_frame, height=8, wrap="word",
                                  state="disabled", relief="sunken", bd=1)
         self._log_text.pack(fill="both", expand=True)
 
-        self._history_log_frame = ttk.Frame(self._notebook)
-        self._notebook.add(self._history_log_frame, text="历史日志")
-
+        self._history_log_frame = ttk.Frame(self._log_container)
         self._history_log_text = tk.Text(self._history_log_frame, height=8, wrap="word",
                                          state="disabled", relief="sunken", bd=1)
         self._history_log_text.pack(fill="both", expand=True)
+
+        # Show current log by default
+        self._log_tab = "current"
+        self._current_log_frame.pack(fill="both", expand=True)
 
     def _browse_dir(self) -> None:
         path = filedialog.askdirectory(title="选择保存目录", parent=self)
@@ -2529,24 +2586,24 @@ class App(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(url)
 
-    def _on_tab_changed(self, event: tk.Event) -> None:
-        """Update button text when tab changes."""
-        selected_tab = self._notebook.select()
-        current_tab = str(self._current_log_frame)
-        if selected_tab == current_tab:
+    def _switch_log_tab(self) -> None:
+        tab = self._log_tab_var.get()
+        self._log_tab = tab
+        if tab == "current":
+            self._history_log_frame.pack_forget()
+            self._current_log_frame.pack(fill="both", expand=True)
             self._clear_btn.configure(text="清除当前日志")
         else:
+            self._current_log_frame.pack_forget()
+            self._history_log_frame.pack(fill="both", expand=True)
             self._clear_btn.configure(text="清除历史日志")
-            # Load history logs lazily
             if not self._history_loaded:
                 self._load_history_logs()
                 self._history_loaded = True
 
     def _clear_log(self) -> None:
         """Clear the currently visible log view and log files."""
-        selected_tab = self._notebook.select()
-        current_tab = str(self._current_log_frame)
-        if selected_tab == current_tab:
+        if self._log_tab == "current":
             log_text = self._log_text
             msg = "确定要清除当前日志显示和本次运行的日志文件吗？"
             mode = "current"
