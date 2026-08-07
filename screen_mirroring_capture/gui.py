@@ -678,7 +678,338 @@ class ScrollableFrame(ttk.Frame):
         return self._inner
 
 
-# ── Record dialog ────────────────────────────────────────────
+def _show_warning(parent: tk.Widget, title: str, message: str) -> None:
+    """Show warning dialog centered on parent."""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.resizable(True, True)
+    dialog.minsize(200, 100)
+    dialog.grab_set()
+
+    msg_frame = ttk.Frame(dialog, padding=20)
+    msg_frame.pack(fill="both", expand=True)
+    text = tk.Text(msg_frame, font=("Microsoft YaHei", 10), wrap="char",
+                   width=50, height=4, relief="flat", bd=0, highlightthickness=0)
+    text.insert("1.0", message)
+    text.configure(state="disabled")
+    text.pack(fill="y", expand=True)
+
+    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
+    btn_frame.pack(fill="x")
+    ttk.Button(btn_frame, text="确定", command=dialog.destroy, width=8).pack(side="right", padx=20)
+
+    dialog.update_idletasks()
+    dialog_w = max(200, min(dialog.winfo_reqwidth(), 500))
+    dialog_h = dialog.winfo_reqheight()
+    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
+    dialog.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
+
+    dialog.wait_window()
+
+
+def _show_error(parent: tk.Widget, title: str, message: str) -> None:
+    """Show error dialog centered on parent."""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.resizable(True, True)
+    dialog.minsize(200, 100)
+    dialog.grab_set()
+
+    msg_frame = ttk.Frame(dialog, padding=20)
+    msg_frame.pack(fill="both", expand=True)
+    text = tk.Text(msg_frame, font=("Microsoft YaHei", 10), wrap="char",
+                   width=50, height=4, relief="flat", bd=0, highlightthickness=0)
+    text.insert("1.0", message)
+    text.configure(state="disabled")
+    text.pack(fill="y", expand=True)
+
+    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
+    btn_frame.pack(fill="x")
+    ttk.Button(btn_frame, text="确定", command=dialog.destroy, width=8).pack(side="right", padx=20)
+
+    dialog.update_idletasks()
+    dialog_w = max(200, min(dialog.winfo_reqwidth(), 500))
+    dialog_h = dialog.winfo_reqheight()
+    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
+    dialog.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
+
+    dialog.wait_window()
+
+
+def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
+    """Show yes/no confirmation dialog centered on parent. Returns True if Yes."""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.resizable(True, True)
+    dialog.minsize(200, 100)
+    dialog.grab_set()
+
+    msg_frame = ttk.Frame(dialog, padding=20)
+    msg_frame.pack(fill="both", expand=True)
+    text = tk.Text(msg_frame, font=("Microsoft YaHei", 10), wrap="char",
+                   width=50, height=4, relief="flat", bd=0, highlightthickness=0)
+    text.insert("1.0", message)
+    text.configure(state="disabled")
+    text.pack(fill="y", expand=True)
+
+    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
+    btn_frame.pack(fill="x")
+
+    result = [False]
+
+    def on_yes():
+        result[0] = True
+        dialog.destroy()
+
+    def on_no():
+        dialog.destroy()
+
+    ttk.Button(btn_frame, text="是", command=on_yes, width=8).pack(side="right", padx=(0, 20))
+    ttk.Button(btn_frame, text="否", command=on_no, width=8).pack(side="right", padx=(0, 10))
+
+    dialog.update_idletasks()
+    dialog_w = dialog.winfo_width()
+    dialog_h = dialog.winfo_height()
+    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
+    dialog.geometry(f"+{x}+{y}")
+
+    dialog.wait_window()
+    return result[0]
+
+
+# ── History dialog ────────────────────────────────────────────
+
+
+class HistoryDialog(tk.Toplevel):
+    """Dialog for viewing capture history."""
+
+    def __init__(self, parent: tk.Tk):
+        super().__init__(parent)
+        self.title("捕获历史")
+        self.resizable(True, True)
+        self.minsize(500, 400)
+        self.grab_set()
+
+        self._parent = parent
+        self._records = _load_history()
+
+        # Buttons at bottom
+        frm_btn = ttk.Frame(self, padding=8)
+        frm_btn.pack(fill="x", side="bottom")
+        ttk.Button(frm_btn, text="清空捕获历史", command=self._clear_history).pack(side="left", padx=4)
+        self._confirm_btn = ttk.Button(frm_btn, text="加载", command=self._confirm_and_close, width=8, state="disabled")
+        self._confirm_btn.pack(side="right", padx=4)
+        ttk.Button(frm_btn, text="关闭", command=self.destroy, width=8).pack(side="right", padx=4)
+
+        # Treeview
+        columns = ("time", "url", "duration", "resolution", "remark")
+        self._tree = ttk.Treeview(self, columns=columns, show="headings", selectmode="browse")
+
+        self._tree.heading("time", text="时间")
+        self._tree.heading("url", text="URL")
+        self._tree.heading("duration", text="时长")
+        self._tree.heading("resolution", text="分辨率")
+        self._tree.heading("remark", text="备注")
+
+        self._tree.column("time", width=110, minwidth=90)
+        self._tree.column("url", width=250, minwidth=150, stretch=True)
+        self._tree.column("duration", width=70, minwidth=60)
+        self._tree.column("resolution", width=70, minwidth=60)
+        self._tree.column("remark", width=100, minwidth=60, stretch=True)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        self._tree.pack(fill="both", expand=True)
+
+        self._tree.bind("<Double-1>", self._on_double_click)
+        self._tree.bind("<Button-3>", self._on_right_click)
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.tag_configure("even", background="#ffffff")
+        self._tree.tag_configure("odd", background="#f2f2f2")
+
+        self._load_records()
+        self._center_on_parent()
+        TreeviewToolTip(self._tree)
+
+    def destroy(self) -> None:
+        self._parent.focus_set()
+        super().destroy()
+
+    def _center_on_parent(self) -> None:
+        self.update_idletasks()
+        dialog_w, dialog_h = 600, 450
+        p = self._parent
+        x = p.winfo_x() + (p.winfo_width() - dialog_w) // 2
+        y = p.winfo_y() + (p.winfo_height() - dialog_h) // 2
+        self.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
+        self.lift()
+        self.focus()
+
+    def _load_records(self) -> None:
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        for i, record in enumerate(reversed(self._records)):
+            tag = "even" if i % 2 == 0 else "odd"
+            self._tree.insert("", "end", values=(
+                record["time"],
+                record["url"],
+                record.get("duration", ""),
+                record.get("resolution", ""),
+                record.get("remark", ""),
+            ), tags=(str(record["id"]), tag))
+
+    def _get_selected_record(self) -> dict | None:
+        selection = self._tree.selection()
+        if not selection:
+            return None
+        item = self._tree.item(selection[0])
+        record_id = int(item["tags"][0])
+        for record in self._records:
+            if record["id"] == record_id:
+                return record
+        return None
+
+    def _on_select(self, event=None) -> None:
+        record = self._get_selected_record()
+        if record:
+            self._confirm_btn.configure(state="normal")
+        else:
+            self._confirm_btn.configure(state="disabled")
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        record = self._get_selected_record()
+        if record:
+            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""), from_history=True)
+            self.destroy()
+
+    def _confirm_and_close(self) -> None:
+        record = self._get_selected_record()
+        if record:
+            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""), from_history=True)
+            self.destroy()
+
+    def _on_right_click(self, event: tk.Event) -> None:
+        selection = self._tree.identify_row(event.y)
+        if not selection:
+            return
+        self._tree.selection_set(selection)
+        record = self._get_selected_record()
+        if not record:
+            return
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="复制 URL", command=self._copy_selected_url)
+        menu.add_command(label="修改备注", command=self._edit_remark_selected)
+        menu.add_command(label="录制", command=self._record_selected_url)
+
+        players = self._parent._config.get("players", {})
+        if players:
+            play_menu = tk.Menu(menu, tearoff=0)
+            for name in players:
+                play_menu.add_command(
+                    label=f"▶ {name}",
+                    command=lambda n=name, u=record["url"]: self._parent._open_in_player(n, u)
+                )
+            menu.add_cascade(label="播放", menu=play_menu)
+
+        menu.add_command(label="删除", command=self._delete_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_selected_url(self) -> None:
+        selection = self._tree.selection()
+        if not selection:
+            return
+        item = self._tree.item(selection[0])
+        record_id = int(item["tags"][0])
+        for record in self._records:
+            if record["id"] == record_id:
+                self.clipboard_clear()
+                self.clipboard_append(record["url"])
+                _show_toast(self, "URL 已复制到剪贴板")
+                break
+
+    def _delete_selected(self) -> None:
+        selection = self._tree.selection()
+        if not selection:
+            return
+        item = self._tree.item(selection[0])
+        record_id = int(item["tags"][0])
+        self._records = [r for r in self._records if r["id"] != record_id]
+        _save_history(self._records)
+        self._load_records()
+
+    def _edit_remark_selected(self) -> None:
+        record = self._get_selected_record()
+        if not record:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("修改备注")
+        dialog.resizable(False, False)
+
+        frm = ttk.Frame(dialog, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="备注:").pack(anchor="w")
+        var = tk.StringVar(value=record.get("remark", ""))
+        entry = ttk.Entry(frm, textvariable=var, width=40)
+        entry.pack(fill="x", pady=(4, 12))
+        entry.focus_set()
+        entry.selection_range(0, "end")
+
+        btn_frm = ttk.Frame(frm)
+        btn_frm.pack(fill="x")
+        result = [False]
+
+        def on_save() -> None:
+            record["remark"] = var.get().strip()
+            _save_history(self._records)
+            self._load_records()
+            result[0] = True
+            dialog.destroy()
+
+        def on_cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(btn_frm, text="取消", command=on_cancel, width=8).pack(side="right", padx=(4, 0))
+        ttk.Button(btn_frm, text="保存", command=on_save, width=8).pack(side="right")
+        entry.bind("<Return>", lambda e: on_save())
+
+        dialog.update_idletasks()
+        dw, dh = dialog.winfo_width(), dialog.winfo_height()
+        x = self.winfo_rootx() + (self.winfo_width() - dw) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dh) // 2
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+        dialog.wait_window()
+        self.grab_set()
+        self.focus_set()
+
+    def _record_selected_url(self) -> None:
+        record = self._get_selected_record()
+        if not record:
+            return
+        url = record["url"]
+        self._parent._load_url_to_ui(url, record_history=False, remark=record.get("remark", ""), from_history=True)
+        save_dir = self._parent._save_dir_var.get().strip()
+        dialog = RecordDialog(self._parent, url, save_dir)
+        result = dialog.show()
+        if result:
+            output, duration = result
+            self.destroy()
+            self._parent._start_recording(url, output, duration)
+
+    def _clear_history(self) -> None:
+        if _ask_yes_no(self, "确认", "确定要清空所有捕获历史记录吗？"):
+            self._records = []
+            _save_history([])
+            self._load_records()
+
+
+# ── Record dialog ──────────────────────────────────────────────
 
 
 class RecordDialog(tk.Toplevel):
@@ -687,6 +1018,7 @@ class RecordDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk, url: str, save_dir: str,
                  stream_duration: float | None = None):
         super().__init__(parent)
+        self._parent = parent
         self.title("录制设置")
         self.resizable(True, True)
         self.minsize(400, 300)
@@ -961,225 +1293,9 @@ def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
     dialog.wait_window()
     return result[0]
 
-
-class HistoryDialog(tk.Toplevel):
-    """Dialog for viewing capture history."""
-
-    def __init__(self, parent: tk.Tk):
-        super().__init__(parent)
-        self.title("捕获历史")
-        self.resizable(True, True)
-        self.minsize(500, 400)
-        self.grab_set()
-
-        self._parent = parent
-        self._records = _load_history()
-
-        # Buttons at bottom
-        frm_btn = ttk.Frame(self, padding=8)
-        frm_btn.pack(fill="x", side="bottom")
-        ttk.Button(frm_btn, text="清空捕获历史", command=self._clear_history).pack(side="left", padx=4)
-        self._confirm_btn = ttk.Button(frm_btn, text="加载", command=self._confirm_and_close, width=8, state="disabled")
-        self._confirm_btn.pack(side="right", padx=4)
-        ttk.Button(frm_btn, text="关闭", command=self.destroy, width=8).pack(side="right", padx=4)
-
-        # Treeview
-        columns = ("time", "url", "duration", "resolution", "remark")
-        self._tree = ttk.Treeview(self, columns=columns, show="headings", selectmode="browse")
-
-        self._tree.heading("time", text="时间")
-        self._tree.heading("url", text="URL")
-        self._tree.heading("duration", text="时长")
-        self._tree.heading("resolution", text="分辨率")
-        self._tree.heading("remark", text="备注")
-
-        self._tree.column("time", width=110, minwidth=90)
-        self._tree.column("url", width=250, minwidth=150, stretch=True)
-        self._tree.column("duration", width=70, minwidth=60)
-        self._tree.column("resolution", width=70, minwidth=60)
-        self._tree.column("remark", width=100, minwidth=60, stretch=True)
-
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._tree.yview)
-        self._tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-
-        self._tree.pack(fill="both", expand=True)
-
-        self._tree.bind("<Double-1>", self._on_double_click)
-        self._tree.bind("<Button-3>", self._on_right_click)
-        self._tree.bind("<<TreeviewSelect>>", self._on_select)
-
-        self._load_records()
-
-        # Center dialog
-        self.update_idletasks()
-        dialog_w, dialog_h = 600, 450
-        x = parent.winfo_x() + (parent.winfo_width() - dialog_w) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - dialog_h) // 2
-        self.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
-        self.lift()
-        self.focus()
-        TreeviewToolTip(self._tree)
-
-    def _load_records(self) -> None:
-        for item in self._tree.get_children():
-            self._tree.delete(item)
-        for record in reversed(self._records):
-            self._tree.insert("", "end", values=(
-                record["time"],
-                record["url"],
-                record.get("duration", ""),
-                record.get("resolution", ""),
-                record.get("remark", ""),
-            ), tags=(str(record["id"]),))
-
-    def _get_selected_record(self) -> dict | None:
-        selection = self._tree.selection()
-        if not selection:
-            return None
-        item = self._tree.item(selection[0])
-        record_id = int(item["tags"][0])
-        for record in self._records:
-            if record["id"] == record_id:
-                return record
-        return None
-
-    def _on_select(self, event=None) -> None:
-        record = self._get_selected_record()
-        if record:
-            self._confirm_btn.configure(state="normal")
-        else:
-            self._confirm_btn.configure(state="disabled")
-
-    def _on_double_click(self, event: tk.Event) -> None:
-        record = self._get_selected_record()
-        if record:
-            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""), from_history=True)
-            self.destroy()
-
-    def _confirm_and_close(self) -> None:
-        record = self._get_selected_record()
-        if record:
-            self._parent._load_url_to_ui(record["url"], record_history=False, remark=record.get("remark", ""), from_history=True)
-            self.destroy()
-
-    def _on_right_click(self, event: tk.Event) -> None:
-        selection = self._tree.identify_row(event.y)
-        if not selection:
-            return
-        self._tree.selection_set(selection)
-        record = self._get_selected_record()
-        if not record:
-            return
-
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="复制 URL", command=self._copy_selected_url)
-        menu.add_command(label="修改备注", command=self._edit_remark_selected)
-        menu.add_command(label="录制", command=self._record_selected_url)
-
-        players = self._parent._config.get("players", {})
-        if players:
-            play_menu = tk.Menu(menu, tearoff=0)
-            for name in players:
-                play_menu.add_command(
-                    label=f"▶ {name}",
-                    command=lambda n=name, u=record["url"]: self._parent._open_in_player(n, u)
-                )
-            menu.add_cascade(label="播放", menu=play_menu)
-
-        menu.add_command(label="删除", command=self._delete_selected)
-        menu.tk_popup(event.x_root, event.y_root)
-
-    def _copy_selected_url(self) -> None:
-        selection = self._tree.selection()
-        if not selection:
-            return
-        item = self._tree.item(selection[0])
-        record_id = int(item["tags"][0])
-        for record in self._records:
-            if record["id"] == record_id:
-                self.clipboard_clear()
-                self.clipboard_append(record["url"])
-                _show_toast(self, "URL 已复制到剪贴板")
-                break
-
-    def _delete_selected(self) -> None:
-        selection = self._tree.selection()
-        if not selection:
-            return
-        item = self._tree.item(selection[0])
-        record_id = int(item["tags"][0])
-        self._records = [r for r in self._records if r["id"] != record_id]
-        _save_history(self._records)
-        self._load_records()
-
-    def _edit_remark_selected(self) -> None:
-        record = self._get_selected_record()
-        if not record:
-            return
-        dialog = tk.Toplevel(self)
-        dialog.title("修改备注")
-        dialog.resizable(False, False)
-
-        frm = ttk.Frame(dialog, padding=16)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="备注:").pack(anchor="w")
-        var = tk.StringVar(value=record.get("remark", ""))
-        entry = ttk.Entry(frm, textvariable=var, width=40)
-        entry.pack(fill="x", pady=(4, 12))
-        entry.focus_set()
-        entry.selection_range(0, "end")
-
-        btn_frm = ttk.Frame(frm)
-        btn_frm.pack(fill="x")
-        result = [False]
-
-        def on_save() -> None:
-            record["remark"] = var.get().strip()
-            _save_history(self._records)
-            self._load_records()
-            result[0] = True
-            dialog.destroy()
-
-        def on_cancel() -> None:
-            dialog.destroy()
-
-        ttk.Button(btn_frm, text="取消", command=on_cancel, width=8).pack(side="right", padx=(4, 0))
-        ttk.Button(btn_frm, text="保存", command=on_save, width=8).pack(side="right")
-        entry.bind("<Return>", lambda e: on_save())
-
-        dialog.update_idletasks()
-        dw, dh = dialog.winfo_width(), dialog.winfo_height()
-        x = self.winfo_rootx() + (self.winfo_width() - dw) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dh) // 2
-        dialog.geometry(f"+{x}+{y}")
-        dialog.grab_set()
-        dialog.wait_window()
-
-    def _record_selected_url(self) -> None:
-        record = self._get_selected_record()
-        if not record:
-            return
-        url = record["url"]
-        self._parent._load_url_to_ui(url, record_history=False, remark=record.get("remark", ""), from_history=True)
-        save_dir = self._parent._save_dir_var.get().strip()
-        dialog = RecordDialog(self._parent, url, save_dir)
-        result = dialog.show()
-        if result:
-            output, duration = result
-            self.destroy()
-            self._parent._start_recording(url, output, duration)
-
-    def _clear_history(self) -> None:
-        if _ask_yes_no(self, "确认", "确定要清空所有捕获历史记录吗？"):
-            self._records = []
-            _save_history([])
-            self._load_records()
-
-
-# ── Player dialog ──────────────────────────────────────────────
-
-
+    def destroy(self) -> None:
+        self._parent.focus_set()
+        super().destroy()
 class PlayerDialog(tk.Toplevel):
     """Dialog for managing media players (add/edit/delete)."""
 
@@ -1198,6 +1314,10 @@ class PlayerDialog(tk.Toplevel):
         self._refresh_list()
         self._center_on_parent()
 
+    def destroy(self) -> None:
+        self._parent.focus_set()
+        super().destroy()
+
     def _center_on_parent(self) -> None:
         self.update_idletasks()
         pw = self._parent.winfo_width()
@@ -1213,42 +1333,134 @@ class PlayerDialog(tk.Toplevel):
     def _build_ui(self) -> None:
         pad = dict(padx=8, pady=4)
 
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill="x", **pad)
-        ttk.Button(btn_frame, text="添加", width=6, command=self._add).pack(side="left", padx=2)
-        ttk.Button(btn_frame, text="编辑", width=6, command=self._edit).pack(side="left", padx=2)
-        ttk.Button(btn_frame, text="删除", width=6, command=self._remove).pack(side="left", padx=2)
+        columns = ("name", "path", "protocol", "manual_protocol")
+        self._tree = ttk.Treeview(self, columns=columns, show="headings", selectmode="browse")
 
-        self._listbox = tk.Listbox(self, height=6, font=("Microsoft YaHei", 9))
-        self._listbox.pack(fill="both", expand=True, **pad)
-        self._listbox.bind("<<ListboxSelect>>", self._on_select)
-        ListboxToolTip(self._listbox)
+        self._tree.heading("name", text="名称")
+        self._tree.heading("path", text="路径")
+        self._tree.heading("protocol", text="自动协议")
+        self._tree.heading("manual_protocol", text="手动协议")
+
+        self._tree.column("name", width=100, minwidth=80)
+        self._tree.column("path", width=220, minwidth=160, stretch=True)
+        self._tree.column("protocol", width=80, minwidth=60)
+        self._tree.column("manual_protocol", width=80, minwidth=60)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        self._tree.pack(fill="both", expand=True, **pad)
+
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.bind("<Button-3>", self._on_right_click)
+        self._tree.tag_configure("even", background="#ffffff")
+        self._tree.tag_configure("odd", background="#f2f2f2")
+        TreeviewToolTip(self._tree)
 
         self._path_var = tk.StringVar()
         ttk.Label(self, textvariable=self._path_var, foreground="gray", wraplength=600).pack(fill="x", padx=8, pady=(0, 4))
 
-        btn_close = ttk.Frame(self)
-        btn_close.pack(fill="x", **pad)
-        ttk.Button(btn_close, text="关闭", command=self.destroy).pack(side="right")
+        btn_bottom = ttk.Frame(self)
+        btn_bottom.pack(fill="x", **pad)
+        btn_bottom.columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        ttk.Button(btn_bottom, text="删除", command=self._remove).grid(row=0, column=0, padx=2)
+        ttk.Button(btn_bottom, text="上移", command=self._move_up).grid(row=0, column=1, padx=2)
+        ttk.Button(btn_bottom, text="下移", command=self._move_down).grid(row=0, column=2, padx=2)
+        ttk.Button(btn_bottom, text="添加", command=self._add).grid(row=0, column=3, padx=2)
+        ttk.Button(btn_bottom, text="编辑", command=self._edit).grid(row=0, column=4, padx=2)
+        ttk.Button(btn_bottom, text="关闭", command=self.destroy).grid(row=0, column=5, padx=2)
 
     def _refresh_list(self) -> None:
-        self._listbox.delete(0, tk.END)
-        for name, entry in self._players.items():
-            self._listbox.insert(tk.END, f"{name}  —  {_get_player_path(entry)}")
-        if self._listbox.size() > 0:
-            self._listbox.selection_set(0)
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        for i, (name, entry) in enumerate(self._players.items()):
+            tag = "even" if i % 2 == 0 else "odd"
+            self._tree.insert("", "end", values=(
+                name,
+                _get_player_path(entry),
+                _get_player_protocol(entry),
+                _get_player_manual_protocol(entry),
+            ), tags=(tag,)) 
+        children = self._tree.get_children()
+        if children:
+            self._tree.selection_set(children[0])
             self._on_select()
 
     def _on_select(self, event=None) -> None:
-        sel = self._listbox.curselection()
+        sel = self._tree.selection()
         if sel:
-            text = self._listbox.get(sel[0])
-            path = text.split("  —  ", 1)[1] if "  —  " in text else ""
-            self._path_var.set(f"路径: {path}")
+            values = self._tree.item(sel[0], "values")
+            self._path_var.set(f"路径: {values[1]}")
         else:
             self._path_var.set("")
 
+    def _on_right_click(self, event: tk.Event) -> None:
+        row = self._tree.identify_row(event.y)
+        if not row:
+            return
+        self._tree.selection_set(row)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="编辑", command=self._edit)
+        menu.add_separator()
+        menu.add_command(label="上移", command=self._move_up)
+        menu.add_command(label="下移", command=self._move_down)
+        menu.add_separator()
+        menu.add_command(label="删除", command=self._remove)
+        menu.add_separator()
+        menu.add_command(label="复制路径", command=self._copy_selected_path)
+        menu.tk_popup(event.x_root, event.y_root)
 
+    def _copy_selected_path(self) -> None:
+        sel = self._tree.selection()
+        if sel:
+            values = self._tree.item(sel[0], "values")
+            self.clipboard_clear()
+            self.clipboard_append(values[1])
+
+    def _move_up(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            _show_warning(self, "提示", "请先选择一个播放器")
+            return
+        name = self._tree.item(sel[0], "values")[0]
+        keys = list(self._players.keys())
+        idx = keys.index(name)
+        if idx == 0:
+            return
+        keys[idx], keys[idx - 1] = keys[idx - 1], keys[idx]
+        ordered = {k: self._players[k] for k in keys}
+        self._players.clear()
+        self._players.update(ordered)
+        _save_config(self._parent._config)
+        self._refresh_list()
+        for item in self._tree.get_children():
+            if self._tree.item(item, "values")[0] == name:
+                self._tree.selection_set(item)
+                break
+        self._on_change()
+
+    def _move_down(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            _show_warning(self, "提示", "请先选择一个播放器")
+            return
+        name = self._tree.item(sel[0], "values")[0]
+        keys = list(self._players.keys())
+        idx = keys.index(name)
+        if idx == len(keys) - 1:
+            return
+        keys[idx], keys[idx + 1] = keys[idx + 1], keys[idx]
+        ordered = {k: self._players[k] for k in keys}
+        self._players.clear()
+        self._players.update(ordered)
+        _save_config(self._parent._config)
+        self._refresh_list()
+        for item in self._tree.get_children():
+            if self._tree.item(item, "values")[0] == name:
+                self._tree.selection_set(item)
+                break
+        self._on_change()
 
     def _add(self) -> None:
         path = filedialog.askopenfilename(
@@ -1258,67 +1470,63 @@ class PlayerDialog(tk.Toplevel):
         )
         if not path:
             return
-        name = self._parent._ask_name_input("播放器名称", "请输入播放器显示名称：", Path(path).stem)
-        if not name:
-            return
-        protocol, manual_protocol = self._ask_protocol_input(name)
-        self._players[name] = {"path": path, "protocol": protocol, "manual_protocol": manual_protocol}
-        _save_config(self._parent._config)
-        self._refresh_list()
-        self._on_change()
 
-    def _ask_protocol_input(self, player_name: str) -> tuple[str, str]:
         dialog = tk.Toplevel(self)
-        dialog.title(f"选择协议 - {player_name}")
-        dialog.minsize(360, 280)
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        dialog.update_idletasks()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        px, py = self.winfo_x(), self.winfo_y()
-        dw, dh = 400, 280
-        dialog.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+        dialog.title("添加播放器")
+        dialog.minsize(420, 0)
+        dialog.resizable(True, True)
 
-        vals = ["auto", "direct", "playlist", "ipc"]
-        desc = {
-            "auto": "自动检测（按程序名判断）",
-            "direct": "直接URL（每次播最新，杀旧重启）",
-            "playlist": "播放列表（.m3u 累积所有URL重启）",
-            "ipc": "IPC追加（命名管道，需mpv支持）",
-        }
-        desc_manual = {
-            "auto": "自动检测（按程序名判断）",
-            "direct": "直接URL（每次开新窗口）",
-            "playlist": "播放列表（临时.m3u，每次开新窗口）",
-            "ipc": "IPC追加（连接已有管道，失败回退direct）",
-        }
+        ttk.Label(dialog, text="播放器名称:").pack(anchor="w", padx=10, pady=(6, 2))
+        name_var = tk.StringVar(value=Path(path).stem)
+        name_entry = ttk.Entry(dialog, textvariable=name_var)
+        name_entry.pack(fill="x", padx=10, pady=(0, 2))
+        name_entry.select_range(0, tk.END)
+        name_entry.focus_set()
 
-        ttk.Label(dialog, text="自动播放协议:").pack(anchor="w", padx=16, pady=(12, 2))
+        ttk.Label(dialog, text="播放器路径:").pack(anchor="w", padx=10, pady=(2, 2))
+        row_path = ttk.Frame(dialog)
+        row_path.pack(fill="x", padx=10)
+        path_var = tk.StringVar(value=path)
+        path_entry = ttk.Entry(row_path, textvariable=path_var)
+        path_entry.pack(side="left", fill="x", expand=True)
+
+        def browse_path():
+            p = filedialog.askopenfilename(
+                title="选择播放器可执行文件",
+                filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")],
+                parent=dialog,
+            )
+            if p:
+                path_var.set(p)
+
+        ttk.Button(row_path, text="浏览...", command=browse_path).pack(side="left", padx=(4, 0))
+
+        ttk.Label(dialog, text="自动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         protocol_var = tk.StringVar(value="auto")
-        combo = ttk.Combobox(dialog, textvariable=protocol_var, values=vals, state="readonly", width=30)
-        combo.pack(fill="x", padx=16, pady=(0, 2))
-        desc_var = tk.StringVar(value=desc["auto"])
-        ttk.Label(dialog, textvariable=desc_var, foreground="gray", wraplength=360).pack(fill="x", padx=16)
+        protocol_combo = ttk.Combobox(dialog, textvariable=protocol_var,
+                                       values=["auto", "direct", "playlist", "ipc"],
+                                       state="readonly")
+        protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
+        protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
 
-        ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=16, pady=(12, 2))
+        ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value="auto")
-        combo_manual = ttk.Combobox(dialog, textvariable=manual_var, values=vals, state="readonly", width=30)
-        combo_manual.pack(fill="x", padx=16, pady=(0, 2))
-        desc_manual_var = tk.StringVar(value=desc_manual["auto"])
-        ttk.Label(dialog, textvariable=desc_manual_var, foreground="gray", wraplength=360).pack(fill="x", padx=16)
+        manual_combo = ttk.Combobox(dialog, textvariable=manual_var,
+                                     values=["auto", "direct", "playlist", "ipc"],
+                                     state="readonly")
+        manual_combo.pack(fill="x", padx=10, pady=(0, 2))
+        manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
 
-        def on_select(_e=None):
-            desc_var.set(desc.get(protocol_var.get(), ""))
-
-        def on_select_manual(_e=None):
-            desc_manual_var.set(desc_manual.get(manual_var.get(), ""))
-
-        combo.bind("<<ComboboxSelected>>", on_select)
-        combo_manual.bind("<<ComboboxSelected>>", on_select_manual)
-
-        result = {"protocol": "auto", "manual_protocol": "auto"}
+        result = {"ok": False}
 
         def confirm():
+            name = name_var.get().strip()
+            if not name:
+                _show_warning(dialog, "提示", "播放器名称不能为空")
+                return
+            result["ok"] = True
+            result["name"] = name
+            result["path"] = path_var.get().strip()
             result["protocol"] = protocol_var.get()
             result["manual_protocol"] = manual_var.get()
             dialog.destroy()
@@ -1327,20 +1535,41 @@ class PlayerDialog(tk.Toplevel):
             dialog.destroy()
 
         btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=(10, 10))
-        ttk.Button(btn_frame, text="确定", command=confirm).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="取消", command=cancel).pack(side="left", padx=4)
+        btn_frame.pack(fill="x", pady=(4, 4))
+        btn_frame.columnconfigure((0, 2, 4), weight=1)
+        ttk.Button(btn_frame, text="取消", command=cancel, width=8).grid(row=0, column=1, padx=4)
+        ttk.Button(btn_frame, text="确定", command=confirm, width=8).grid(row=0, column=3, padx=4)
+        name_entry.bind("<Return>", lambda e: confirm())
+
+        dialog.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_x(), self.winfo_y()
+        dw = 460
+        dh = dialog.winfo_reqheight()
+        x = px + (pw - dw) // 2
+        y = py + (ph - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+        dialog.grab_set()
 
         self.wait_window(dialog)
-        return result["protocol"], result["manual_protocol"]
+        if not result.get("ok"):
+            return
+
+        name = result.get("name", "")
+        player_path = result.get("path", path)
+        protocol = result.get("protocol", "auto")
+        manual_protocol = result.get("manual_protocol", "auto")
+        self._players[name] = {"path": player_path, "protocol": protocol, "manual_protocol": manual_protocol}
+        _save_config(self._parent._config)
+        self._refresh_list()
+        self._on_change()
 
     def _remove(self) -> None:
-        sel = self._listbox.curselection()
+        sel = self._tree.selection()
         if not sel:
             _show_warning(self, "提示", "请先选择一个播放器")
             return
-        text = self._listbox.get(sel[0])
-        name = text.split("  —  ", 1)[0]
+        name = self._tree.item(sel[0], "values")[0]
         if len(self._players) <= 1:
             _show_warning(self, "提示", "至少保留一个播放器")
             return
@@ -1352,12 +1581,11 @@ class PlayerDialog(tk.Toplevel):
         self._on_change()
 
     def _edit(self) -> None:
-        sel = self._listbox.curselection()
+        sel = self._tree.selection()
         if not sel:
             _show_warning(self, "提示", "请先选择一个播放器")
             return
-        text = self._listbox.get(sel[0])
-        old_name = text.split("  —  ", 1)[0]
+        old_name = self._tree.item(sel[0], "values")[0]
         old_entry = self._players.get(old_name, "")
         old_path = _get_player_path(old_entry)
         old_protocol = _get_player_protocol(old_entry)
@@ -1365,19 +1593,13 @@ class PlayerDialog(tk.Toplevel):
 
         dialog = tk.Toplevel(self)
         dialog.title("编辑播放器")
-        dialog.minsize(420, 340)
+        dialog.minsize(420, 0)
         dialog.resizable(True, True)
-        dialog.grab_set()
-        dialog.update_idletasks()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        px, py = self.winfo_x(), self.winfo_y()
-        dw, dh = 460, 360
-        dialog.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
 
-        ttk.Label(dialog, text="播放器名称:").pack(anchor="w", padx=10, pady=(10, 2))
+        ttk.Label(dialog, text="播放器名称:").pack(anchor="w", padx=10, pady=(6, 2))
         name_var = tk.StringVar(value=old_name)
         name_entry = ttk.Entry(dialog, textvariable=name_var)
-        name_entry.pack(fill="x", padx=10, pady=(0, 5))
+        name_entry.pack(fill="x", padx=10, pady=(0, 2))
         name_entry.select_range(0, tk.END)
         name_entry.focus_set()
 
@@ -1399,19 +1621,21 @@ class PlayerDialog(tk.Toplevel):
 
         ttk.Button(row_path, text="浏览...", command=browse_path).pack(side="left", padx=(4, 0))
 
-        ttk.Label(dialog, text="自动播放协议:").pack(anchor="w", padx=10, pady=(8, 2))
+        ttk.Label(dialog, text="自动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         protocol_var = tk.StringVar(value=old_protocol)
         protocol_combo = ttk.Combobox(dialog, textvariable=protocol_var,
                                        values=["auto", "direct", "playlist", "ipc"],
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
+        protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
 
-        ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(8, 2))
+        ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value=old_manual)
         manual_combo = ttk.Combobox(dialog, textvariable=manual_var,
                                      values=["auto", "direct", "playlist", "ipc"],
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
+        manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
 
         result = {"ok": False}
         def confirm():
@@ -1431,12 +1655,25 @@ class PlayerDialog(tk.Toplevel):
             dialog.destroy()
 
         btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=(10, 10))
-        ttk.Button(btn_frame, text="确定", command=confirm).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="取消", command=cancel).pack(side="left", padx=4)
+        btn_frame.pack(fill="x", pady=(4, 4))
+        btn_frame.columnconfigure((0, 2, 4), weight=1)
+        ttk.Button(btn_frame, text="取消", command=cancel, width=8).grid(row=0, column=1, padx=4)
+        ttk.Button(btn_frame, text="确定", command=confirm, width=8).grid(row=0, column=3, padx=4)
         name_entry.bind("<Return>", lambda e: confirm())
 
+        dialog.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_x(), self.winfo_y()
+        dw = 460
+        dh = dialog.winfo_reqheight()
+        x = px + (pw - dw) // 2
+        y = py + (ph - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+        dialog.grab_set()
+
         self.wait_window(dialog)
+        self.grab_set()
+        self.focus_set()
         if not result.get("ok"):
             return
 
@@ -1469,10 +1706,11 @@ class ToolTip:
         self._tw = tk.Toplevel(event.widget)
         self._tw.wm_overrideredirect(True)
         self._tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
-        lbl = tk.Label(
-            self._tw, text=text,             bg="#ffffff", fg="#333",
+        lbl = tk.Message(
+            self._tw, text=text, bg="#ffffff", fg="#333",
             font=("Microsoft YaHei", 9), padx=6, pady=2,
-            relief="solid", borderwidth=1,
+            relief="solid", borderwidth=1, width=400,
+            aspect=800,
         )
         lbl.pack()
 
@@ -1520,10 +1758,11 @@ class TreeviewToolTip:
         self._tw = tk.Toplevel(self._tv)
         self._tw.wm_overrideredirect(True)
         self._tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
-        lbl = tk.Label(
+        lbl = tk.Message(
             self._tw, text=text, bg="#ffffff", fg="#333",
             font=("Microsoft YaHei", 9), padx=6, pady=2,
-            relief="solid", borderwidth=1,
+            relief="solid", borderwidth=1, width=400,
+            aspect=800,
         )
         lbl.pack()
 
@@ -1545,10 +1784,12 @@ class ListboxToolTip:
     def _on_motion(self, event: tk.Event) -> None:
         idx = self._lb.nearest(event.y)
         if 0 <= idx < self._lb.size():
-            text = self._lb.get(idx)
-            if text:
-                self._show(event, text)
-                return
+            bbox = self._lb.bbox(idx)
+            if bbox and bbox[1] <= event.y <= bbox[1] + bbox[3]:
+                text = self._lb.get(idx)
+                if text:
+                    self._show(event, text)
+                    return
         self.hide()
 
     def _on_leave(self, event: tk.Event) -> None:
@@ -1559,10 +1800,11 @@ class ListboxToolTip:
         self._tw = tk.Toplevel(self._lb)
         self._tw.wm_overrideredirect(True)
         self._tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
-        lbl = tk.Label(
+        lbl = tk.Message(
             self._tw, text=text, bg="#ffffff", fg="#333",
             font=("Microsoft YaHei", 9), padx=6, pady=2,
-            relief="solid", borderwidth=1,
+            relief="solid", borderwidth=1, width=400,
+            aspect=800,
         )
         lbl.pack()
 
@@ -1575,12 +1817,12 @@ class ListboxToolTip:
 class App(tk.Tk):
     """Main application window."""
 
-    MIN_WIDTH = 560
-    MIN_HEIGHT = 480
+    MIN_WIDTH = 400
+    MIN_HEIGHT = 300
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.3.0")
+        self.title("screen-mirroring-capture v1.4.0")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -1624,6 +1866,22 @@ class App(tk.Tk):
         self._build_ui()
         self._remove_focus_ring()
         self._setup_logging()
+        self.bind_all("<Button-1>", self._on_global_click, add="+")
+
+    def _on_global_click(self, event) -> None:
+        w = event.widget
+        if isinstance(w, (
+            ttk.Button, ttk.Entry, ttk.Combobox, tk.Text,
+            ttk.Spinbox, ttk.Checkbutton, ttk.Radiobutton,
+            tk.Listbox, ttk.Scrollbar, ttk.Progressbar,
+        )):
+            return
+        try:
+            if w.winfo_toplevel().overrideredirect():
+                return
+        except Exception:
+            return
+        w.after_idle(w.focus_set)
 
     def _remove_focus_ring(self) -> None:
         """Remove dotted focus rectangles from all ttk widgets."""
@@ -1665,6 +1923,8 @@ class App(tk.Tk):
         self._content_canvas.bind("<Configure>", _on_canvas_configure)
 
         def _on_mousewheel(event):
+            if self.grab_current() is not None and self.grab_current() != self:
+                return
             x, y = self.winfo_pointerxy()
             w = self.winfo_containing(x, y)
             if isinstance(w, (tk.Text, ttk.Spinbox, ttk.Combobox)):
@@ -1686,6 +1946,7 @@ class App(tk.Tk):
         # ── 设备设置 ──
         dev_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         dev_wrapper.pack(fill="x", **pad)
+        dev_wrapper.bind("<Button-1>", lambda e: self.focus_set())
         frm_dev = ttk.LabelFrame(dev_wrapper, text="设备设置", padding=8)
         frm_dev.pack(fill="x", expand=True)
 
@@ -1724,7 +1985,7 @@ class App(tk.Tk):
         else:
             self._bind_ip_var.set("自动检测")
         self._net_combo.grid(row=0, column=3, sticky="ew", padx=(4, 0))
-        self._net_combo.bind("<<ComboboxSelected>>", lambda e: (self._save_device_settings(), self._net_tt.hide(), self.focus()))
+        self._net_combo.bind("<<ComboboxSelected>>", lambda e: (self._save_device_settings(), self._net_tt.hide(), self.after(10, self.focus_set)))
         self._net_tt = ToolTip(self._net_combo, lambda: self._bind_ip_var.get())
         self._net_combo.bind("<Button-1>", lambda e: self._net_tt.hide(), add="+")
         self._net_combo.bind("<FocusOut>", lambda e: self._net_tt.hide(), add="+")
@@ -1762,6 +2023,7 @@ class App(tk.Tk):
         # ── 捕获 ──
         capture_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         capture_wrapper.pack(fill="x", **pad)
+        capture_wrapper.bind("<Button-1>", lambda e: self.focus_set())
         frm_capture = ttk.LabelFrame(capture_wrapper, text="捕获", padding=8)
         frm_capture.pack(fill="x", expand=True)
 
@@ -1809,14 +2071,33 @@ class App(tk.Tk):
         self._player_buttons_frame = ttk.Frame(frm_capture)
         self._player_buttons_frame.pack(fill="x", pady=(8, 0))
         self._player_buttons: dict[str, ttk.Button] = {}
-        ttk.Label(self._player_buttons_frame, text="播放器:").pack(side="left")
+        self._player_btn_list: list[ttk.Widget] = []
+
+        self._player_lbl = ttk.Label(self._player_buttons_frame, text="播放器:")
+        self._player_lbl.pack(side="left")
+        self._player_btn_list.append(self._player_lbl)
+
         players = self._config.get("players", {})
         for name in players:
-            btn = ttk.Button(self._player_buttons_frame, text=f"▶ {name}", command=lambda n=name: self._open_in_player(n), state="disabled")
+            btn = ttk.Button(self._player_buttons_frame, text=f"▶ {name}",
+                             command=lambda n=name: self._open_in_player(n),
+                             state="disabled")
             btn.pack(side="left", padx=2)
             self._player_buttons[name] = btn
+            self._player_btn_list.append(btn)
+
         self._edit_btn = ttk.Button(self._player_buttons_frame, text="编辑", command=self._open_player_dialog)
         self._edit_btn.pack(side="left", padx=(4, 0))
+        self._player_btn_list.append(self._edit_btn)
+
+        self._player_buttons_frame.update_idletasks()
+        self._player_btn_widths = [w.winfo_width() for w in self._player_btn_list]
+
+        for w in self._player_btn_list:
+            w.pack_forget()
+
+        self._layout_player_buttons()
+        self._player_buttons_frame.bind("<Configure>", lambda e: self._layout_player_buttons())
 
         # Auto-play
         row_auto = ttk.Frame(frm_capture)
@@ -1835,14 +2116,20 @@ class App(tk.Tk):
         ttk.Label(row_auto, text="防抖(秒):").pack(side="left", padx=(12, 2))
         self._debounce_var = tk.DoubleVar(value=self._config.get("manual_click_debounce", 2.0))
         debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
-                                     textvariable=self._debounce_var, width=5,
-                                     command=self._save_debounce_settings)
+                                     textvariable=self._debounce_var, width=5)
         debounce_spin.pack(side="left")
+        def _debounce_wheel(event):
+            self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        debounce_spin.bind("<MouseWheel>", _debounce_wheel)
+        debounce_spin.bind("<Button-4>", _debounce_wheel)
+        debounce_spin.bind("<Button-5>", _debounce_wheel)
         debounce_spin.bind("<FocusOut>", lambda e: self._save_debounce_settings())
 
         # ── 录制 ──
         rec_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
         rec_wrapper.pack(fill="x", **pad)
+        rec_wrapper.bind("<Button-1>", lambda e: self.focus_set())
         frm_rec = ttk.LabelFrame(rec_wrapper, text="录制", padding=8)
         frm_rec.pack(fill="x", expand=True)
 
@@ -1853,15 +2140,6 @@ class App(tk.Tk):
         self._save_dir_entry = ttk.Entry(row_rec, textvariable=self._save_dir_var, width=40)
         self._save_dir_entry.pack(side="left", padx=(4, 4), fill="x", expand=True)
         ttk.Button(row_rec, text="浏览", command=self._browse_dir).pack(side="left")
-
-        row_rec_ctrl = ttk.Frame(frm_rec)
-        row_rec_ctrl.pack(fill="x", pady=(6, 0))
-        self._rec_btn = ttk.Button(row_rec_ctrl, text="录制", command=self._on_record_click, width=8, state="disabled")
-        self._rec_btn.pack(side="left", padx=4)
-        self._stop_rec_btn = ttk.Button(row_rec_ctrl, text="停止录制", command=self._stop_recording, width=10, state="disabled")
-        self._stop_rec_btn.pack(side="left", padx=4)
-        self._rec_status_var = tk.StringVar(value="")
-        ttk.Label(row_rec_ctrl, textvariable=self._rec_status_var, foreground="purple").pack(side="left", padx=16)
 
         # AirPlay audio recording
         row_audio = ttk.Frame(frm_rec)
@@ -1883,6 +2161,15 @@ class App(tk.Tk):
         self._progress_bar = ttk.Progressbar(frm_rec, mode="determinate")
         self._progress_bar.pack(fill="x", pady=(2, 0))
 
+        row_rec_ctrl = ttk.Frame(frm_rec)
+        row_rec_ctrl.pack(fill="x", pady=(6, 0))
+        self._rec_btn = ttk.Button(row_rec_ctrl, text="录制", command=self._on_record_click, width=8, state="disabled")
+        self._rec_btn.pack(side="left", padx=4)
+        self._stop_rec_btn = ttk.Button(row_rec_ctrl, text="停止录制", command=self._stop_recording, width=10, state="disabled")
+        self._stop_rec_btn.pack(side="left", padx=4)
+        self._rec_status_var = tk.StringVar(value="")
+        ttk.Label(row_rec_ctrl, textvariable=self._rec_status_var, foreground="purple").pack(side="left", padx=16)
+
         # ── 日志 ──
         log_inner = ttk.Frame(self._paned)
         log_inner.pack_propagate(False)
@@ -1896,11 +2183,11 @@ class App(tk.Tk):
         self._log_tab_var = tk.StringVar(value="current")
         self._log_current_rb = ttk.Radiobutton(row_bottom, text="当前日志",
                                                 variable=self._log_tab_var, value="current",
-                                                command=self._switch_log_tab)
+                                                command=self._switch_log_tab, takefocus=0)
         self._log_current_rb.pack(side="left", padx=2)
         self._log_history_rb = ttk.Radiobutton(row_bottom, text="历史日志",
                                                 variable=self._log_tab_var, value="history",
-                                                command=self._switch_log_tab)
+                                                command=self._switch_log_tab, takefocus=0)
         self._log_history_rb.pack(side="left", padx=2)
         self._verbose_cb = ttk.Checkbutton(row_bottom, text="启用调试日志",
                                             variable=self._verbose_var, command=self._on_verbose_change)
@@ -2009,43 +2296,6 @@ class App(tk.Tk):
     def _stop(self) -> None:
         self._stop_event.set()
         self._show_status("● 正在停止...", "orange")
-
-    def _ask_name_input(self, title: str, prompt: str, default: str = "") -> str | None:
-        """Simple dialog to ask for a text input."""
-        dialog = tk.Toplevel(self)
-        dialog.title(title)
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        # Center on parent
-        dialog.update_idletasks()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        px, py = self.winfo_x(), self.winfo_y()
-        dw, dh = 300, 120
-        dialog.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
-        result = {"value": None}
-
-        ttk.Label(dialog, text=prompt, wraplength=280).pack(pady=(10, 5), padx=10)
-        var = tk.StringVar(value=default)
-        entry = ttk.Entry(dialog, textvariable=var, width=30)
-        entry.pack(padx=10, pady=(0, 10))
-        entry.select_range(0, tk.END)
-        entry.focus_set()
-
-        def confirm():
-            result["value"] = var.get().strip()
-            dialog.destroy()
-
-        def cancel():
-            dialog.destroy()
-
-        entry.bind("<Return>", lambda e: confirm())
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=(0, 10))
-        ttk.Button(btn_frame, text="确定", command=confirm).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="取消", command=cancel).pack(side="left", padx=4)
-
-        self.wait_window(dialog)
-        return result["value"] if result["value"] else None
 
     def _open_in_player(self, player_name: str, url: str | None = None) -> None:
         """Open captured URL in a specific player by name."""
@@ -2276,6 +2526,53 @@ class App(tk.Tk):
         self._config["manual_kill_prev"] = self._manual_kill_prev_var.get()
         _save_config(self._config)
 
+    def _layout_player_buttons(self) -> None:
+        frame = self._player_buttons_frame
+        frame.update_idletasks()
+        available = frame.winfo_width()
+        if available < 20:
+            return
+        available -= 8
+
+        gaps = []
+        for i in range(len(self._player_btn_list)):
+            if i == 0:
+                gaps.append(0)
+            elif i == len(self._player_btn_list) - 1:
+                gaps.append(2)
+            else:
+                gaps.append(2)
+
+        total = sum(self._player_btn_widths[i] + gaps[i] * 2 for i in range(len(self._player_btn_list)))
+
+        for w in self._player_btn_list:
+            w.pack_forget()
+            w.grid_forget()
+
+        if total <= available:
+            for i, w in enumerate(self._player_btn_list):
+                if i == 0:
+                    w.pack(side="left")
+                elif i == len(self._player_btn_list) - 1:
+                    w.pack(side="left", padx=(4, 0))
+                else:
+                    w.pack(side="left", padx=2)
+            return
+
+        row = 0
+        col = 0
+        x = 0
+        for i, w in enumerate(self._player_btn_list):
+            gap = gaps[i]
+            space = self._player_btn_widths[i] + gap * 2
+            if x + space > available and col > 0:
+                row += 1
+                col = 0
+                x = 0
+            w.grid(row=row, column=col, sticky="w", padx=(gap, gap))
+            x += space
+            col += 1
+
     def _rebuild_player_buttons(self) -> None:
         """Rebuild the player buttons in the capture card."""
         if not hasattr(self, "_player_buttons_frame"):
@@ -2283,7 +2580,15 @@ class App(tk.Tk):
         for btn in self._player_buttons.values():
             btn.destroy()
         self._player_buttons.clear()
-        self._edit_btn.pack_forget()
+        self._player_btn_list.clear()
+
+        if hasattr(self, "_player_lbl"):
+            self._player_lbl.destroy()
+
+        self._player_lbl = ttk.Label(self._player_buttons_frame, text="播放器:")
+        self._player_lbl.pack(side="left")
+        self._player_btn_list.append(self._player_lbl)
+
         state = "normal" if self._url_var.get() else "disabled"
         players = self._config.get("players", {})
         for name in players:
@@ -2292,7 +2597,18 @@ class App(tk.Tk):
                              state=state)
             btn.pack(side="left", padx=2)
             self._player_buttons[name] = btn
+            self._player_btn_list.append(btn)
+
         self._edit_btn.pack(side="left", padx=(4, 0))
+        self._player_btn_list.append(self._edit_btn)
+
+        self._player_buttons_frame.update_idletasks()
+        self._player_btn_widths = [w.winfo_width() for w in self._player_btn_list]
+
+        for w in self._player_btn_list:
+            w.pack_forget()
+
+        self._layout_player_buttons()
 
     def _on_players_changed(self) -> None:
         self._rebuild_player_buttons()
@@ -2453,6 +2769,7 @@ class App(tk.Tk):
         dialog.geometry(f"+{x}+{y}")
         dialog.grab_set()
         dialog.wait_window()
+        self.focus_set()
 
     def _start_recording(self, url: str, output: str, duration: float | None = None) -> None:
         ffmpeg = shutil.which("ffmpeg")
@@ -2645,6 +2962,7 @@ class App(tk.Tk):
         dialog.geometry(f"+{x}+{y}")
 
         dialog.wait_window()
+        self.focus_set()
 
         if result[0]:
             # Clear display
