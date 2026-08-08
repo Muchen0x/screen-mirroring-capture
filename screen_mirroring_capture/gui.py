@@ -678,6 +678,22 @@ class ScrollableFrame(ttk.Frame):
         return self._inner
 
 
+def _show_toast(parent: tk.Widget, message: str, duration: int = 1500) -> None:
+    """Show auto-dismiss toast notification."""
+    toast = tk.Toplevel(parent)
+    toast.overrideredirect(True)
+    toast.attributes("-topmost", True)
+
+    toast_w, toast_h = 220, 50
+    x = parent.winfo_rootx() + (parent.winfo_width() - toast_w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - toast_h) // 2
+    toast.geometry(f"{toast_w}x{toast_h}+{x}+{y}")
+
+    tk.Label(toast, text=message, bg="#4a90d9", fg="white",
+             font=("Microsoft YaHei", 10)).pack(fill="both", expand=True)
+    toast.after(duration, toast.destroy)
+
+
 def _show_warning(parent: tk.Widget, title: str, message: str) -> None:
     """Show warning dialog centered on parent."""
     dialog = tk.Toplevel(parent)
@@ -1187,115 +1203,11 @@ class RecordDialog(tk.Toplevel):
         self.wait_window()
         return self._result
 
-
-# ── History dialog ───────────────────────────────────────────
-
-
-def _show_toast(parent: tk.Widget, message: str, duration: int = 1500) -> None:
-    """Show auto-dismiss toast notification."""
-    toast = tk.Toplevel(parent)
-    toast.overrideredirect(True)
-    toast.attributes("-topmost", True)
-
-    toast_w, toast_h = 220, 50
-    x = parent.winfo_rootx() + (parent.winfo_width() - toast_w) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - toast_h) // 2
-    toast.geometry(f"{toast_w}x{toast_h}+{x}+{y}")
-
-    tk.Label(toast, text=message, bg="#4a90d9", fg="white",
-             font=("Microsoft YaHei", 10)).pack(fill="both", expand=True)
-    toast.after(duration, toast.destroy)
-
-
-def _show_warning(parent: tk.Widget, title: str, message: str) -> None:
-    """Show warning dialog centered on parent."""
-    dialog = tk.Toplevel(parent)
-    dialog.title(title)
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    msg_frame = ttk.Frame(dialog, padding=20)
-    msg_frame.pack(fill="both", expand=True)
-    ttk.Label(msg_frame, text=message, font=("Microsoft YaHei", 10)).pack()
-
-    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
-    btn_frame.pack(fill="x")
-    ttk.Button(btn_frame, text="确定", command=dialog.destroy, width=8).pack(side="right", padx=20)
-
-    dialog.update_idletasks()
-    dialog_w = dialog.winfo_width()
-    dialog_h = dialog.winfo_height()
-    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
-    dialog.geometry(f"+{x}+{y}")
-
-    dialog.wait_window()
-
-
-def _show_error(parent: tk.Widget, title: str, message: str) -> None:
-    """Show error dialog centered on parent."""
-    dialog = tk.Toplevel(parent)
-    dialog.title(title)
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    msg_frame = ttk.Frame(dialog, padding=20)
-    msg_frame.pack(fill="both", expand=True)
-    ttk.Label(msg_frame, text=message, font=("Microsoft YaHei", 10)).pack()
-
-    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
-    btn_frame.pack(fill="x")
-    ttk.Button(btn_frame, text="确定", command=dialog.destroy, width=8).pack(side="right", padx=20)
-
-    dialog.update_idletasks()
-    dialog_w = dialog.winfo_width()
-    dialog_h = dialog.winfo_height()
-    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
-    dialog.geometry(f"+{x}+{y}")
-
-    dialog.wait_window()
-
-
-def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
-    """Show yes/no confirmation dialog centered on parent. Returns True if Yes."""
-    dialog = tk.Toplevel(parent)
-    dialog.title(title)
-    dialog.resizable(False, False)
-    dialog.grab_set()
-
-    msg_frame = ttk.Frame(dialog, padding=20)
-    msg_frame.pack(fill="both", expand=True)
-    ttk.Label(msg_frame, text=message, font=("Microsoft YaHei", 10)).pack()
-
-    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
-    btn_frame.pack(fill="x")
-
-    result = [False]
-
-    def on_yes():
-        result[0] = True
-        dialog.destroy()
-
-    def on_no():
-        dialog.destroy()
-
-    ttk.Button(btn_frame, text="是", command=on_yes, width=8).pack(side="right", padx=(0, 20))
-    ttk.Button(btn_frame, text="否", command=on_no, width=8).pack(side="right", padx=(0, 10))
-
-    dialog.update_idletasks()
-    dialog_w = dialog.winfo_width()
-    dialog_h = dialog.winfo_height()
-    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
-    dialog.geometry(f"+{x}+{y}")
-
-    dialog.wait_window()
-    return result[0]
-
     def destroy(self) -> None:
         self._parent.focus_set()
         super().destroy()
+
+
 class PlayerDialog(tk.Toplevel):
     """Dialog for managing media players (add/edit/delete)."""
 
@@ -1822,7 +1734,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.4.0")
+        self.title("screen-mirroring-capture v1.4.1")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"

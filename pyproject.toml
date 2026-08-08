@@ -1,6 +1,6 @@
 [project]
 name = "screen-mirroring-capture"
-version = "1.4.0"
+version = "1.4.1"
 description = "Capture live stream URLs via fake screen casting (DLNA / AirPlay / Chromecast)"
 readme = "README.md"
 requires-python = ">=3.10"
