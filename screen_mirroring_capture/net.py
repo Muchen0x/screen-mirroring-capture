@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 
 import ifaddr
+
+log = logging.getLogger(__name__)
 
 # Only consider physical network interfaces (Ethernet / WiFi).
 # Virtual interfaces (Tailscale utun*, VPN tun*, Docker veth*, etc.) are skipped.
@@ -50,17 +53,11 @@ def _is_private(ip: str) -> bool:
 
 
 def get_lan_ip() -> str:
-    """Return the first private LAN IP found on a physical network interface.
-
-    Only considers ``en*`` (macOS Ethernet/WiFi), ``eth*`` and ``wlan*``
-    (Linux).  Skips VPN (utun/tun), Tailscale, Docker, and other virtual
-    interfaces.
-
-    Falls back to the default-route IP if no match is found.
-    """
     adapters = ifaddr.get_adapters()
+    log.debug("get_lan_ip: 共 %d 个适配器", len(adapters))
+    for ad in adapters:
+        log.debug("  适配器: name=%s nice=%s", ad.name, getattr(ad, "nice_name", ""))
 
-    # Pass 1: physical interfaces only.
     for adapter in adapters:
         if not _is_physical(adapter):
             continue
@@ -68,9 +65,9 @@ def get_lan_ip() -> str:
             if not isinstance(ip_info.ip, str):
                 continue
             if _is_private(ip_info.ip):
+                log.debug("get_lan_ip: 物理接口 → %s (%s)", ip_info.ip, _get_display_name(adapter))
                 return ip_info.ip
 
-    # Pass 2: any non-virtual interface (in case naming doesn't match).
     for adapter in adapters:
         if _is_virtual(adapter):
             continue
@@ -80,13 +77,15 @@ def get_lan_ip() -> str:
             if ip_info.ip.startswith("127."):
                 continue
             if _is_private(ip_info.ip):
+                log.debug("get_lan_ip: 非虚拟接口 → %s (%s)", ip_info.ip, _get_display_name(adapter))
                 return ip_info.ip
 
-    # Fallback: default route (may hit VPN).
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        ip = s.getsockname()[0]
+        log.debug("get_lan_ip: 兜底默认路由 → %s", ip)
+        return ip
     finally:
         s.close()
 

@@ -6,10 +6,13 @@ that DLNA controllers on the local network can discover our renderer.
 
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 import threading
 from email.utils import formatdate
+
+log = logging.getLogger(__name__)
 
 MULTICAST_ADDR = "239.255.255.250"
 MULTICAST_PORT = 1900
@@ -39,9 +42,11 @@ class SSDPAdvertiser:
         self._stop = threading.Event()
 
     def start(self) -> None:
+        log.info("SSDP 服务广播启动: uuid=%s location=%s ip=%s", self._uuid, self._location, self._local_ip)
         threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self) -> None:
+        log.info("SSDP 服务广播停止")
         self._stop.set()
 
     def _loop(self) -> None:
@@ -50,7 +55,7 @@ class SSDPAdvertiser:
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except AttributeError:
-            pass  # Windows
+            pass
 
         sock.bind(("", MULTICAST_PORT))
         mreq = struct.pack(
@@ -59,7 +64,6 @@ class SSDPAdvertiser:
             socket.inet_aton(self._local_ip),
         )
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        # Ensure NOTIFY multicast goes out on the correct LAN interface
         sock.setsockopt(
             socket.IPPROTO_IP,
             socket.IP_MULTICAST_IF,
@@ -67,6 +71,7 @@ class SSDPAdvertiser:
         )
         sock.settimeout(2.0)
 
+        log.debug("SSDP 套接字就绪: %s:1900", self._local_ip)
         self._notify(sock)
 
         while not self._stop.is_set():
@@ -81,11 +86,13 @@ class SSDPAdvertiser:
                     or "RenderingControl" in msg
                     or "ConnectionManager" in msg
                 ):
+                    log.debug("SSDP M-SEARCH 来自 %s", addr)
                     self._respond(sock, addr)
             except socket.timeout:
                 self._notify(sock)
 
         sock.close()
+        log.debug("SSDP 循环退出")
 
     def _notify(self, sock: socket.socket) -> None:
         for nt in [self._uuid] + _NOTIFY_TYPES:

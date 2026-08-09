@@ -13,7 +13,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -22,11 +21,11 @@ import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 from typing import Callable
 
 from . import PROTOCOLS, capture
-from .net import list_adapters
+from .net import get_lan_ip, list_adapters
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +79,26 @@ _FORMAT_OPTIONS = [
     (".flac", "FLAC"),
 ]
 
+_PROTOCOL_HELP = (
+    "各协议选项含义：\n\n"
+    "▸ auto（自动模式）— 推荐\n"
+    "  根据 URL 扩展名自动选择播放方式：\n"
+    "  · .m3u8 / .flv → URL 直接传递给播放器\n"
+    "  · 其他格式 → 自动生成 .m3u 播放列表\n"
+    "    文件后传递给播放器\n\n"
+    "▸ direct（直连模式）\n"
+    "  不做任何检测或预处理，直接用原始 URL\n"
+    "  重启播放器进程\n\n"
+    "▸ playlist（列表模式）\n"
+    "  始终生成 .m3u 播放列表文件，再将文件\n"
+    "  传递给播放器。适用于 VLC、MPC-HC、\n"
+    "  MPC-BE、mpv 等\n\n"
+    "▸ ipc（进程通信模式）— 仅 mpv\n"
+    "  不启动新进程，通过 Windows 命名管道\n"
+    "  向已有 mpv 发送 loadfile 指令，实现\n"
+    "  无缝切换播放内容"
+)
+
 def _get_player_path(entry: str | dict) -> str:
     if isinstance(entry, dict):
         return entry.get("path", "")
@@ -98,28 +117,27 @@ def _get_player_manual_protocol(entry: str | dict) -> str:
     return "auto"
 
 
+def _log_stderr(proc: subprocess.Popen, prefix: str = "") -> None:
+    def _reader():
+        for line in iter(proc.stderr.readline, b""):
+            log.debug("%sstderr: %s", prefix, line.decode("utf-8", errors="replace").rstrip())
+    threading.Thread(target=_reader, daemon=True).start()
+
+
 def _find_player_executable(path_or_cmd: str | dict) -> str | None:
-    """Find a player executable by command name or full path.
-
-    Args:
-        path_or_cmd: A command name (e.g. "vlc"), full path, or dict with "path" key.
-
-    Returns:
-        Full path to the executable, or None if not found.
-    """
     if isinstance(path_or_cmd, dict):
         path_or_cmd = path_or_cmd.get("path", "")
     if not path_or_cmd:
+        log.debug("_find_player_executable: empty input")
         return None
-    # Check if it's a full path that exists
     p = Path(path_or_cmd)
     if p.is_absolute() and p.exists():
+        log.debug("_find_player_executable: found at absolute path %s", p)
         return str(p)
-    # Search PATH
     found = shutil.which(path_or_cmd)
     if found:
+        log.debug("_find_player_executable: found via PATH → %s", found)
         return found
-    # Common fallback paths
     if "vlc" in path_or_cmd.lower():
         common = [
             Path("C:/Program Files/VideoLAN/VLC/vlc.exe"),
@@ -128,7 +146,9 @@ def _find_player_executable(path_or_cmd: str | dict) -> str | None:
         ]
         for fp in common:
             if fp.exists():
+                log.debug("_find_player_executable: found VLC at fallback %s", fp)
                 return str(fp)
+        log.debug("_find_player_executable: VLC fallback paths all missing")
     elif "mpv" in path_or_cmd.lower():
         common = [
             Path("C:/mpv/mpv.exe"),
@@ -136,7 +156,11 @@ def _find_player_executable(path_or_cmd: str | dict) -> str | None:
         ]
         for fp in common:
             if fp.exists():
+                log.debug("_find_player_executable: found mpv at fallback %s", fp)
                 return str(fp)
+        log.debug("_find_player_executable: mpv fallback paths all missing")
+    else:
+        log.debug("_find_player_executable: %s not found anywhere", path_or_cmd)
     return None
 
 
@@ -174,8 +198,6 @@ def _load_config() -> dict:
     config = {"players": _seed_default_players()}
     _save_config(config)
     return config
-    if changed:
-        _save_config(config)
 
 
 def _save_config(config: dict) -> None:
@@ -460,6 +482,7 @@ class PersistentTextHandler(logging.Handler):
         super().__init__()
         self._widget = widget
         self._root = root
+        self._log_counter = 0
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self.log_file = LOG_DIR / f"session_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
@@ -471,10 +494,13 @@ class PersistentTextHandler(logging.Handler):
         self._append_file(msg)
 
     def _append_ui(self, msg: str) -> None:
-        self._widget.configure(state="normal")
-        self._widget.insert("end", msg + "\n")
+        tag = "log_even" if self._log_counter % 2 == 0 else "log_odd"
+        self._log_counter += 1
+        self._widget.insert("end", msg + "\n\n", tag)
         self._widget.see("end")
-        self._widget.configure(state="disabled")
+
+    def reset_counter(self) -> None:
+        self._log_counter = 0
 
     def _append_file(self, msg: str) -> None:
         try:
@@ -678,20 +704,22 @@ class ScrollableFrame(ttk.Frame):
         return self._inner
 
 
-def _show_toast(parent: tk.Widget, message: str, duration: int = 1500) -> None:
-    """Show auto-dismiss toast notification."""
+def _show_toast(parent: tk.Widget, message: str, duration: int = 2000) -> None:
     toast = tk.Toplevel(parent)
     toast.overrideredirect(True)
-    toast.attributes("-topmost", True)
-
-    toast_w, toast_h = 220, 50
-    x = parent.winfo_rootx() + (parent.winfo_width() - toast_w) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - toast_h) // 2
-    toast.geometry(f"{toast_w}x{toast_h}+{x}+{y}")
-
-    tk.Label(toast, text=message, bg="#4a90d9", fg="white",
-             font=("Microsoft YaHei", 10)).pack(fill="both", expand=True)
+    lbl = ttk.Label(toast, text=message, padding=(16, 8), background="#333333",
+                    foreground="white", font=("Microsoft YaHei", 9))
+    lbl.pack()
+    toast.update_idletasks()
+    pw = parent.winfo_width()
+    ph = parent.winfo_height()
+    px = parent.winfo_rootx()
+    py = parent.winfo_rooty()
+    tw = toast.winfo_reqwidth()
+    th = toast.winfo_reqheight()
+    toast.geometry(f"+{px + pw - tw - 20}+{py + ph - th - 40}")
     toast.after(duration, toast.destroy)
+    toast.transient(parent)
 
 
 def _show_warning(parent: tk.Widget, title: str, message: str) -> None:
@@ -725,33 +753,7 @@ def _show_warning(parent: tk.Widget, title: str, message: str) -> None:
 
 
 def _show_error(parent: tk.Widget, title: str, message: str) -> None:
-    """Show error dialog centered on parent."""
-    dialog = tk.Toplevel(parent)
-    dialog.title(title)
-    dialog.resizable(True, True)
-    dialog.minsize(200, 100)
-    dialog.grab_set()
-
-    msg_frame = ttk.Frame(dialog, padding=20)
-    msg_frame.pack(fill="both", expand=True)
-    text = tk.Text(msg_frame, font=("Microsoft YaHei", 10), wrap="char",
-                   width=50, height=4, relief="flat", bd=0, highlightthickness=0)
-    text.insert("1.0", message)
-    text.configure(state="disabled")
-    text.pack(fill="y", expand=True)
-
-    btn_frame = ttk.Frame(dialog, padding=(0, 10, 0, 15))
-    btn_frame.pack(fill="x")
-    ttk.Button(btn_frame, text="确定", command=dialog.destroy, width=8).pack(side="right", padx=20)
-
-    dialog.update_idletasks()
-    dialog_w = max(200, min(dialog.winfo_reqwidth(), 500))
-    dialog_h = dialog.winfo_reqheight()
-    x = parent.winfo_rootx() + (parent.winfo_width() - dialog_w) // 2
-    y = parent.winfo_rooty() + (parent.winfo_height() - dialog_h) // 2
-    dialog.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
-
-    dialog.wait_window()
+    _show_warning(parent, title, message)
 
 
 def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
@@ -1420,6 +1422,7 @@ class PlayerDialog(tk.Toplevel):
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
         protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        ToolTip(protocol_combo, lambda: _PROTOCOL_HELP)
 
         ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value="auto")
@@ -1428,6 +1431,7 @@ class PlayerDialog(tk.Toplevel):
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
         manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        ToolTip(manual_combo, lambda: _PROTOCOL_HELP)
 
         result = {"ok": False}
 
@@ -1540,6 +1544,7 @@ class PlayerDialog(tk.Toplevel):
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
         protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        ToolTip(protocol_combo, lambda: _PROTOCOL_HELP)
 
         ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value=old_manual)
@@ -1548,6 +1553,7 @@ class PlayerDialog(tk.Toplevel):
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
         manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        ToolTip(manual_combo, lambda: _PROTOCOL_HELP)
 
         result = {"ok": False}
         def confirm():
@@ -1593,8 +1599,13 @@ class PlayerDialog(tk.Toplevel):
         new_path = result["path"]
         new_protocol = result.get("protocol", "auto")
         new_manual = result.get("manual_protocol", "auto")
-        del self._players[old_name]
-        self._players[new_name] = {"path": new_path, "protocol": new_protocol, "manual_protocol": new_manual}
+        new_entry = {"path": new_path, "protocol": new_protocol, "manual_protocol": new_manual}
+        if new_name == old_name:
+            self._players[old_name] = new_entry
+        else:
+            items = [(new_name, new_entry) if k == old_name else (k, v) for k, v in self._players.items()]
+            self._players.clear()
+            self._players.update(items)
         _save_config(self._parent._config)
         self._refresh_list()
         self._on_change()
@@ -1734,7 +1745,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.4.1")
+        self.title("screen-mirroring-capture v1.5.0")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -1793,7 +1804,7 @@ class App(tk.Tk):
                 return
         except Exception:
             return
-        w.after_idle(w.focus_set)
+        w.after(0, w.focus_set)
 
     def _remove_focus_ring(self) -> None:
         """Remove dotted focus rectangles from all ttk widgets."""
@@ -1813,9 +1824,13 @@ class App(tk.Tk):
         self.destroy()
 
     def _build_ui(self) -> None:
-        pad = dict(padx=8, pady=4)
+        self._build_scrollable_panel()
+        self._build_device_settings()
+        self._build_capture_panel()
+        self._build_recording_panel()
+        self._build_log_panel()
 
-        # ── 可滚动面板 ──
+    def _build_scrollable_panel(self) -> None:
         self._paned = tk.PanedWindow(self, orient="vertical", sashwidth=8, sashrelief="ridge", bg="#e0e0e0")
         self._paned.pack(fill="both", expand=True)
 
@@ -1855,9 +1870,10 @@ class App(tk.Tk):
         self._content_frame.bind("<Button-1>", lambda e: self.focus_set())
         self._paned.add(top_frame, stretch="always")
 
-        # ── 设备设置 ──
+    def _build_device_settings(self) -> None:
+        pd = dict(padx=8, pady=4)
         dev_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
-        dev_wrapper.pack(fill="x", **pad)
+        dev_wrapper.pack(fill="x", **pd)
         dev_wrapper.bind("<Button-1>", lambda e: self.focus_set())
         frm_dev = ttk.LabelFrame(dev_wrapper, text="设备设置", padding=8)
         frm_dev.pack(fill="x", expand=True)
@@ -1885,7 +1901,6 @@ class App(tk.Tk):
             row1, textvariable=self._bind_ip_var, values=adapter_options,
             state="readonly",
         )
-        # Restore selection from config
         saved_ip = self._config.get("bind_ip", "")
         if saved_ip:
             for label, ip in self._adapter_map.items():
@@ -1929,12 +1944,12 @@ class App(tk.Tk):
         self._restore_btn = ttk.Button(row_proto, text="恢复默认", command=self._restore_defaults)
         self._restore_btn.pack(side="left", padx=(8, 0))
 
-        # Debug logging toggle (moved to log section)
         self._verbose_var = tk.BooleanVar(value=self._config.get("verbose", False))
 
-        # ── 捕获 ──
+    def _build_capture_panel(self) -> None:
+        pd = dict(padx=8, pady=4)
         capture_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
-        capture_wrapper.pack(fill="x", **pad)
+        capture_wrapper.pack(fill="x", **pd)
         capture_wrapper.bind("<Button-1>", lambda e: self.focus_set())
         frm_capture = ttk.LabelFrame(capture_wrapper, text="捕获", padding=8)
         frm_capture.pack(fill="x", expand=True)
@@ -1959,7 +1974,7 @@ class App(tk.Tk):
         self._url_var = tk.StringVar()
         self._url_entry = ttk.Entry(row_url, textvariable=self._url_var, state="readonly")
         self._url_entry.pack(side="left", fill="x", expand=True, padx=4)
-        ToolTip(self._url_entry, lambda: self._url_var.get())
+        self._url_tip = ToolTip(self._url_entry, lambda: self._url_var.get())
         ttk.Button(row_url, text="📋 复制", command=self._copy_url).pack(side="left")
 
         frm_info = ttk.Frame(frm_capture)
@@ -1968,7 +1983,6 @@ class App(tk.Tk):
         self._info_var = tk.StringVar(value="")
         ttk.Label(frm_info, textvariable=self._info_var, foreground="blue").pack(side="left", padx=(4, 0))
 
-        # Remark display
         row_remark = ttk.Frame(frm_capture)
         row_remark.pack(fill="x", pady=(4, 0))
         ttk.Label(row_remark, text="备注:").pack(side="left")
@@ -1979,7 +1993,6 @@ class App(tk.Tk):
         self._remark_btn.pack(side="left", padx=(4, 0))
         self._update_remark_mode()
 
-        # Player buttons
         self._player_buttons_frame = ttk.Frame(frm_capture)
         self._player_buttons_frame.pack(fill="x", pady=(8, 0))
         self._player_buttons: dict[str, ttk.Button] = {}
@@ -2011,7 +2024,6 @@ class App(tk.Tk):
         self._layout_player_buttons()
         self._player_buttons_frame.bind("<Configure>", lambda e: self._layout_player_buttons())
 
-        # Auto-play
         row_auto = ttk.Frame(frm_capture)
         row_auto.pack(fill="x", pady=(4, 0))
         self._auto_play_var = tk.BooleanVar(value=self._config.get("auto_play", False))
@@ -2038,9 +2050,10 @@ class App(tk.Tk):
         debounce_spin.bind("<Button-5>", _debounce_wheel)
         debounce_spin.bind("<FocusOut>", lambda e: self._save_debounce_settings())
 
-        # ── 录制 ──
+    def _build_recording_panel(self) -> None:
+        pd = dict(padx=8, pady=4)
         rec_wrapper = tk.Frame(self._content_frame, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
-        rec_wrapper.pack(fill="x", **pad)
+        rec_wrapper.pack(fill="x", **pd)
         rec_wrapper.bind("<Button-1>", lambda e: self.focus_set())
         frm_rec = ttk.LabelFrame(rec_wrapper, text="录制", padding=8)
         frm_rec.pack(fill="x", expand=True)
@@ -2053,7 +2066,6 @@ class App(tk.Tk):
         self._save_dir_entry.pack(side="left", padx=(4, 4), fill="x", expand=True)
         ttk.Button(row_rec, text="浏览", command=self._browse_dir).pack(side="left")
 
-        # AirPlay audio recording
         row_audio = ttk.Frame(frm_rec)
         row_audio.pack(fill="x", pady=(6, 0))
         self._audio_rec_var = tk.BooleanVar(value=False)
@@ -2082,16 +2094,16 @@ class App(tk.Tk):
         self._rec_status_var = tk.StringVar(value="")
         ttk.Label(row_rec_ctrl, textvariable=self._rec_status_var, foreground="purple").pack(side="left", padx=16)
 
-        # ── 日志 ──
+    def _build_log_panel(self) -> None:
+        pd = dict(padx=8, pady=4)
         log_inner = ttk.Frame(self._paned)
         log_inner.pack_propagate(False)
-        log_inner.configure(height=125)
+        log_inner.configure(height=135)
         self._paned.add(log_inner, minsize=70, stretch="never")
         tk.Frame(log_inner, height=3, bg="#888").pack(fill="x", pady=(0, 4))
 
-        # Bottom toolbar (outside log_wrapper, always visible)
         row_bottom = ttk.Frame(log_inner)
-        row_bottom.pack(side="bottom", fill="x", **pad)
+        row_bottom.pack(side="bottom", fill="x", **pd)
         self._log_tab_var = tk.StringVar(value="current")
         self._log_current_rb = ttk.Radiobutton(row_bottom, text="当前日志",
                                                 variable=self._log_tab_var, value="current",
@@ -2108,25 +2120,33 @@ class App(tk.Tk):
         self._clear_btn.pack(side="right", padx=2)
 
         log_wrapper = tk.Frame(log_inner, highlightbackground="#888", highlightthickness=1, bd=0, bg="#e0e0e0")
-        log_wrapper.pack(fill="both", expand=True, **pad)
+        log_wrapper.pack(fill="both", expand=True, **pd)
         frm_log = ttk.LabelFrame(log_wrapper, text="日志", padding=8)
         frm_log.pack(fill="both", expand=True)
 
-        # Log text container
         self._log_container = ttk.Frame(frm_log)
         self._log_container.pack(fill="both", expand=True)
 
         self._current_log_frame = ttk.Frame(self._log_container)
         self._log_text = tk.Text(self._current_log_frame, height=8, wrap="word",
-                                 state="disabled", relief="sunken", bd=1)
+                                 state="normal", relief="sunken", bd=1,
+                                 bg="#fafafa",
+                                 selectbackground="#3399FF", selectforeground="white")
         self._log_text.pack(fill="both", expand=True)
+        self._log_text.tag_configure("sel", background="#3399FF", foreground="white")
+        self._log_text.tag_raise("sel")
+        self._log_text.bind("<Key>", lambda e: "break")
 
         self._history_log_frame = ttk.Frame(self._log_container)
         self._history_log_text = tk.Text(self._history_log_frame, height=8, wrap="word",
-                                         state="disabled", relief="sunken", bd=1)
+                                          state="normal", relief="sunken", bd=1,
+                                          bg="#fafafa",
+                                          selectbackground="#3399FF", selectforeground="white")
         self._history_log_text.pack(fill="both", expand=True)
+        self._history_log_text.tag_configure("sel", background="#3399FF", foreground="white")
+        self._history_log_text.tag_raise("sel")
+        self._history_log_text.bind("<Key>", lambda e: "break")
 
-        # Show current log by default
         self._log_tab = "current"
         self._current_log_frame.pack(fill="both", expand=True)
 
@@ -2183,7 +2203,7 @@ class App(tk.Tk):
         logging.getLogger().setLevel(level)
         self._text_handler = PersistentTextHandler(self._log_text, self)
         self._text_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s.%(funcName)s] %(message)s", datefmt="%H:%M:%S")
         self._text_handler.setFormatter(formatter)
         logging.getLogger().addHandler(self._text_handler)
         self._current_log_file = self._text_handler.log_file
@@ -2199,6 +2219,13 @@ class App(tk.Tk):
         protos = [p for p in PROTOCOLS if self._proto_vars[p].get()]
         ports = {p: int(self._port_vars[p].get().strip()) for p in PROTOCOLS}
         bind_ip = self._adapter_map.get(self._bind_ip_var.get(), "")
+        if not bind_ip:
+            resolved_ip = get_lan_ip()
+            for label, ip in self._adapter_map.items():
+                if ip == resolved_ip:
+                    self._bind_ip_var.set(label)
+                    bind_ip = resolved_ip
+                    break
         threading.Thread(
             target=self._capture_thread_fn,
             args=(self._config["device_name"], ports, protos, bind_ip),
@@ -2262,34 +2289,44 @@ class App(tk.Tk):
         # Resolve protocol
         if protocol == "auto":
             is_playlist = self._is_playlist_stem(stem)
+            log.info("协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
         elif protocol in ("playlist", "ipc"):
             is_playlist = True
+            log.info("协议决策: %s → playlist", protocol)
         else:
             is_playlist = False
+            log.info("协议决策: %s → direct", protocol)
 
         # IPC: try append to existing pipe
         if protocol == "ipc" and "mpv" in stem and self._ipc_pipe:
+            log.debug("IPC 尝试追加: pipe=%s url=%s", self._ipc_pipe, url)
             if self._mpv_ipc_append(url):
                 log.info("手动播放(IPC) %s: %s", player_name, url)
                 return True
+            log.debug("IPC 追加失败，回退到新进程")
 
         try:
             if is_playlist:
                 playlist_path = Path(tempfile.gettempdir()) / f"smc_manual_{os.getpid()}_{id(url)}.m3u"
                 playlist_path.write_text(f"#EXTM3U\n{url}\n", encoding="utf-8")
+                log.debug(".m3u 已写入 %s: %s", playlist_path, url)
                 if "mpv" in stem:
                     pipe_name = f"smc-mpv-manual-{os.getpid()}-{id(url)}"
-                    cmd = [player_path, f"--input-ipc-server=\\.\pipe\{pipe_name}", str(playlist_path)]
+                    log.debug("手动播放 IPC pipe: %s", pipe_name)
+                    cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{pipe_name}", str(playlist_path)]
+                    self._ipc_pipe = pipe_name
                 else:
                     cmd = [player_path, str(playlist_path)]
-                if url.lower().endswith((".m3u8", ".m3u")):
+                if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
                     cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
             else:
                 cmd = [player_path, url]
                 if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
                     cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
-            proc = subprocess.Popen(cmd)
+            log.debug("手动播放 cmd: %s", cmd)
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+            _log_stderr(proc, f"[手动 {player_name}] ")
             self._manual_player_procs.append(proc)
             log.info("手动播放 %s: %s", player_name, url)
             return True
@@ -2314,21 +2351,27 @@ class App(tk.Tk):
         # Resolve protocol
         if protocol == "auto":
             is_playlist = self._is_playlist_stem(stem)
+            log.info("协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
         elif protocol in ("playlist", "ipc"):
             is_playlist = True
+            log.info("协议决策: %s → playlist", protocol)
         else:
             is_playlist = False
+            log.info("协议决策: %s → direct", protocol)
 
         # IPC: try append when same player and alive
         if protocol == "ipc" and "mpv" in stem and self._player_proc and self._player_proc.poll() is None and player_name == self._last_player_name:
+            log.debug("自动播放 IPC 尝试追加: pipe=%s url=%s", self._ipc_pipe, url)
             if self._mpv_ipc_append(url):
                 self._playlist_urls.clear()
                 self._playlist_urls.append(url)
                 self._write_playlist()
                 log.info("自动播放(IPC) %s: %s", player_name, url)
                 return True
+            log.debug("自动播放 IPC 追加失败，将重启进程")
 
         # Always kill old process before starting fresh
+        log.debug("自动播放: 终止旧进程")
         self._stop_player()
         if player_name != self._last_player_name:
             self._playlist_urls.clear()
@@ -2340,21 +2383,25 @@ class App(tk.Tk):
         try:
             if is_playlist:
                 self._write_playlist()
+                log.debug("自动播放: .m3u 文件 %s 包含 %d 个 URL", self._playlist_path, len(self._playlist_urls))
                 if "mpv" in stem:
                     pipe_name = f"smc-mpv-{os.getpid()}"
                     self._ipc_pipe = pipe_name
-                    cmd = [player_path, f"--input-ipc-server=\\.\pipe\{pipe_name}", str(self._playlist_path)]
+                    log.debug("自动播放 IPC pipe: %s", pipe_name)
+                    cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{pipe_name}", str(self._playlist_path)]
                 else:
                     cmd = [player_path, str(self._playlist_path)]
                 has_hls = any(u.lower().endswith((".m3u8", ".m3u")) for u in self._playlist_urls)
-                if has_hls:
+                if "ffplay" in stem and has_hls:
                     cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
             else:
                 cmd = [player_path, url]
                 if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
                     cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
-            self._player_proc = subprocess.Popen(cmd)
+            log.debug("自动播放 cmd: %s", cmd)
+            self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+            _log_stderr(self._player_proc, f"[自动 {player_name}] ")
             log.info("自动播放 %s: %s", player_name, url)
             return True
         except Exception as exc:
@@ -2877,22 +2924,19 @@ class App(tk.Tk):
         self.focus_set()
 
         if result[0]:
-            # Clear display
-            log_text.configure(state="normal")
             log_text.delete("1.0", "end")
-            log_text.configure(state="disabled")
-            # Clear log files
+            if mode == "current":
+                self._text_handler.reset_counter()
             _clear_log_files(mode=mode, current_file=self._current_log_file)
 
     def _load_history_logs(self) -> None:
         """Load historical logs into history log text widget."""
         recent = _load_recent_logs(500)
         if recent:
-            self._history_log_text.configure(state="normal")
-            for line in recent:
-                self._history_log_text.insert("end", line + "\n")
+            for idx, line in enumerate(recent):
+                tag = "log_even" if idx % 2 == 0 else "log_odd"
+                self._history_log_text.insert("end", line + "\n\n", tag)
             self._history_log_text.see("end")
-            self._history_log_text.configure(state="disabled")
         else:
             _show_toast(self, "没有找到历史日志")
 
