@@ -1,7 +1,7 @@
 """UPnP/DLNA XML descriptors for a MediaRenderer device.
 
 These are static XML templates served over HTTP when a DLNA controller
-(e.g. a DLNA controller app) discovers and queries our fake renderer.
+(e.g. WeChat) discovers and queries our fake renderer.
 """
 
 DEVICE = """<?xml version="1.0" encoding="utf-8"?>

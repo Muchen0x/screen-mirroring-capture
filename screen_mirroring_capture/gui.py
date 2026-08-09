@@ -680,24 +680,26 @@ class ScrollableFrame(ttk.Frame):
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
-        self._inner.bind("<Enter>", lambda e: self._bind_mousewheel())
-        self._inner.bind("<Leave>", lambda e: self._unbind_mousewheel())
-
-    def _bind_mousewheel(self) -> None:
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self._canvas.bind_all("<Button-4>", self._on_mousewheel)
-        self._canvas.bind_all("<Button-5>", self._on_mousewheel)
-
-    def _unbind_mousewheel(self) -> None:
-        self._canvas.unbind_all("<MouseWheel>")
-        self._canvas.unbind_all("<Button-4>")
-        self._canvas.unbind_all("<Button-5>")
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self._canvas.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self._canvas.bind_all("<Button-5>", self._on_mousewheel, add="+")
 
     def _on_mousewheel(self, event: tk.Event) -> None:
+        try:
+            if not self._canvas.winfo_exists():
+                return
+            x, y = self._canvas.winfo_pointerxy()
+            cx, cy = self._canvas.winfo_rootx(), self._canvas.winfo_rooty()
+            cw, ch = self._canvas.winfo_width(), self._canvas.winfo_height()
+        except tk.TclError:
+            return
+        if not (cx <= x < cx + cw and cy <= y < cy + ch):
+            return
         if event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
             self._canvas.yview_scroll(-1, "units")
         elif event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
             self._canvas.yview_scroll(1, "units")
+        return "break"
 
     @property
     def inner(self) -> ttk.Frame:
@@ -796,6 +798,34 @@ def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
 
     dialog.wait_window()
     return result[0]
+
+
+def _show_protocol_help(parent: tk.Widget) -> None:
+    dialog = tk.Toplevel(parent)
+    dialog.title("协议说明")
+    dialog.configure(bg="#e0e0e0")
+    dialog.resizable(True, True)
+
+    text = tk.Text(dialog, wrap="char", bg="#e0e0e0", fg="#000000",
+                   font=("Microsoft YaHei", 10), relief="flat",
+                   borderwidth=0, padx=4, pady=4)
+    text.insert("1.0", _PROTOCOL_HELP)
+    text.configure(state="disabled")
+    text.pack(fill="both", expand=True)
+
+    dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+    dialog.update_idletasks()
+    w = max(280, min(dialog.winfo_reqwidth(), 380))
+    h = max(110, min(dialog.winfo_reqheight(), 200))
+    x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+    dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.focus_set()
+    dialog.wait_window()
 
 
 # ── History dialog ────────────────────────────────────────────
@@ -1422,7 +1452,6 @@ class PlayerDialog(tk.Toplevel):
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
         protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
-        ToolTip(protocol_combo, lambda: _PROTOCOL_HELP)
 
         ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value="auto")
@@ -1431,7 +1460,10 @@ class PlayerDialog(tk.Toplevel):
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
         manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
-        ToolTip(manual_combo, lambda: _PROTOCOL_HELP)
+
+        ttk.Button(dialog, text="协议说明",
+                   command=lambda: _show_protocol_help(dialog)
+                   ).pack(fill="x", padx=10, pady=(6, 0))
 
         result = {"ok": False}
 
@@ -1544,7 +1576,6 @@ class PlayerDialog(tk.Toplevel):
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
         protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
-        ToolTip(protocol_combo, lambda: _PROTOCOL_HELP)
 
         ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value=old_manual)
@@ -1553,7 +1584,10 @@ class PlayerDialog(tk.Toplevel):
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
         manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
-        ToolTip(manual_combo, lambda: _PROTOCOL_HELP)
+
+        ttk.Button(dialog, text="协议说明",
+                   command=lambda: _show_protocol_help(dialog)
+                   ).pack(fill="x", padx=10, pady=(6, 0))
 
         result = {"ok": False}
         def confirm():
@@ -1745,7 +1779,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.5.0")
+        self.title("screen-mirroring-capture v1.5.1")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -2373,8 +2407,8 @@ class App(tk.Tk):
         # Always kill old process before starting fresh
         log.debug("自动播放: 终止旧进程")
         self._stop_player()
+        self._playlist_urls.clear()
         if player_name != self._last_player_name:
-            self._playlist_urls.clear()
             self._ipc_pipe = ""
 
         self._last_player_name = player_name
@@ -2458,8 +2492,8 @@ class App(tk.Tk):
                     self._player_proc.wait(timeout=2)
                 except Exception:
                     pass
-            self._player_proc = None
             log.info("自动播放进程已终止")
+        self._player_proc = None
 
     def _save_auto_play_settings(self) -> None:
         self._config["auto_play"] = self._auto_play_var.get()
@@ -2571,7 +2605,10 @@ class App(tk.Tk):
 
     def _on_players_changed(self) -> None:
         self._rebuild_player_buttons()
-        self._auto_play_combo.configure(values=list(self._config.get("players", {}).keys()))
+        names = list(self._config.get("players", {}).keys())
+        self._auto_play_combo.configure(values=names)
+        if self._auto_play_player_var.get() not in names:
+            self._auto_play_player_var.set("")
 
     def _open_player_dialog(self) -> None:
         """Open the player management dialog."""

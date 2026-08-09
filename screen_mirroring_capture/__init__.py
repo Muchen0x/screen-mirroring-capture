@@ -1,7 +1,7 @@
 """screen-mirroring-capture — Capture live stream URLs via fake screen casting.
 
-Pretends to be a TV on your local network. When a live stream is cast
-to it, the real m3u8 stream URL is captured.
+Pretends to be a TV on your local network. When you cast a WeChat Video
+Channel (视频号) live stream to it, the real m3u8 stream URL is captured.
 
 Supports multiple casting protocols: DLNA/UPnP, AirPlay, and Google Cast.
 

@@ -15,7 +15,8 @@ from screen_mirroring_capture import PROTOCOLS, capture
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Capture live stream URLs via fake screen casting (DLNA / AirPlay / Chromecast)."
+            "Capture WeChat Video Channel (视频号) live stream URLs "
+            "via fake screen casting (DLNA / AirPlay / Chromecast)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
