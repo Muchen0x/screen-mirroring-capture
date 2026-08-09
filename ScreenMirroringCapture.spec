@@ -5,7 +5,7 @@ a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/icon.ico', 'assets')],
+    datas=[('assets\\icon.ico', 'assets')],
     hiddenimports=['screen_mirroring_capture.gui'],
     hookspath=[],
     hooksconfig={},
@@ -33,7 +33,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='version.txt',
-    icon=['assets/icon.ico'],
+    icon=['assets\\icon.ico'],
 )
 coll = COLLECT(
     exe,

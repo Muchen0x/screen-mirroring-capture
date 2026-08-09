@@ -4,7 +4,7 @@
 
 | 命令 | 作用 |
 |---|---|
-| `python -m screen_mirroring_capture` | 命令行模式，启动所有协议嗅探投屏 URL，打印到 stdout |
+| `python -m screen_mirroring_capture` | 命令行模式，启动所有协议捕获投屏 URL，打印到 stdout |
 | `python -m screen_mirroring_capture --gui` | 启动 tkinter 图形界面 |
 | `screen-mirroring-capture` | pip 安装后的 CLI 入口，同上 |
 | `screen-mirroring-capture-gui` | pip 安装后的 GUI 入口，直接启动图形界面 |

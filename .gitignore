@@ -3,11 +3,13 @@ __pycache__/
 .venv/
 venv/
 dist/
-config/
-log/
 *.egg-info/
 .DS_Store
 .idea/
 uv.lock
 .claude/
+log/
+build/
+
+config/
 CHANGELOG.md
