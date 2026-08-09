@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from zeroconf import ServiceInfo, Zeroconf
+from zeroconf._exceptions import NonUniqueNameException
 
 from .generated.cast_channel_pb2 import CastMessage
 
@@ -163,8 +164,14 @@ class CastReceiver:
             },
         )
         self._zc = Zeroconf(interfaces=[self._ip])
-        self._zc.register_service(self._info)
-        log.debug("Cast advertised on %s:%d", self._ip, self._port)
+        try:
+            self._zc.register_service(self._info)
+            log.debug("Cast advertised on %s:%d", self._ip, self._port)
+        except NonUniqueNameException:
+            log.warning(
+                "Cast service name already exists on network, "
+                "advertising skipped (service still accepts direct connections)"
+            )
 
     def stop(self) -> None:
         self._stop_event.set()

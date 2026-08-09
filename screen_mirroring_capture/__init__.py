@@ -116,7 +116,7 @@ def capture(
             threading.Thread(target=server.serve_forever, daemon=True).start()
             cleanups.extend([server.shutdown, ssdp.stop])
             started.append("dlna")
-            log.debug("DLNA advertised on %s:%d", local_ip, port)
+            log.info("DLNA advertised on %s:%d", local_ip, port)
             print(f'  📺 DLNA    "{name}" on {local_ip}:{port}', file=sys.stderr)
         except Exception:
             log.warning("Failed to start DLNA", exc_info=True)
@@ -139,6 +139,7 @@ def capture(
             airplay_recv.start()
             cleanups.append(airplay_recv.stop)
             started.append("airplay")
+            log.info("AirPlay advertised on %s:%d", local_ip, ap_port)
             print(
                 f'  🍎 AirPlay "{name}" on {local_ip}:{ap_port}', file=sys.stderr
             )
@@ -153,11 +154,11 @@ def capture(
             cp_port = cast_port
             cast_recv = CastReceiver(name, local_ip, cp_port, _handle, on_play=on_play)
             cast_recv.start()
-            cleanups.append(cast_recv.stop)
             started.append("cast")
-            print(f'  📡 Cast    "{name}" on {local_ip}:{cp_port}', file=sys.stderr)
+            cleanups.append(cast_recv.stop)
+            log.info("Cast advertised on %s:%d", local_ip, cp_port)
         except Exception:
-            log.warning("Failed to start Cast", exc_info=True)
+            log.warning("Failed to start Cast receiver", exc_info=True)
             print("  ⚠️  Cast   failed to start (see --verbose)", file=sys.stderr)
 
     if not started:
