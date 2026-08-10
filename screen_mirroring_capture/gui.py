@@ -8,9 +8,11 @@ Launch with::
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -118,9 +120,32 @@ def _get_player_manual_protocol(entry: str | dict) -> str:
 
 
 def _log_stderr(proc: subprocess.Popen, prefix: str = "") -> None:
+    _MAX_LINE = 4000
+
     def _reader():
-        for line in iter(proc.stderr.readline, b""):
-            log.debug("%sstderr: %s", prefix, line.decode("utf-8", errors="replace").rstrip())
+        buf = b""
+        while True:
+            try:
+                chunk = proc.stderr.read(4096)
+            except Exception:
+                return
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = re.split(rb"[\r\n]+", buf)
+            for line in lines:
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                if len(text) > _MAX_LINE:
+                    text = text[:_MAX_LINE] + f"...(截断 {len(text)} 字符)"
+                log.debug("%sstderr: %s", prefix, text)
+        if buf:
+            text = buf.decode("utf-8", errors="replace").strip()
+            if text:
+                if len(text) > _MAX_LINE:
+                    text = text[:_MAX_LINE] + f"...(截断 {len(text)} 字符)"
+                log.debug("%sstderr: %s", prefix, text)
     threading.Thread(target=_reader, daemon=True).start()
 
 
@@ -490,10 +515,12 @@ class PersistentTextHandler(logging.Handler):
         msg = self.format(record)
         if "Using proactor:" in msg:
             return
-        self._root.after(0, self._append_ui, msg)
+        self._root._call_ui(self._append_ui, msg)
         self._append_file(msg)
 
     def _append_ui(self, msg: str) -> None:
+        if len(msg) > 8192:
+            msg = msg[:8192] + "\n...(日志过长已截断)"
         tag = "log_even" if self._log_counter % 2 == 0 else "log_odd"
         self._log_counter += 1
         self._widget.insert("end", msg + "\n\n", tag)
@@ -1819,10 +1846,14 @@ class App(tk.Tk):
         self._manual_player_procs: list[subprocess.Popen] = []
         self._manual_kill_prev_var = tk.BooleanVar(value=self._config.get("manual_kill_prev", False))
         self._log_tab: str = "current"
+        self._ui_queue: queue.Queue[tuple] = queue.Queue()
+        self._auto_play_last_url: str = ""
+        self._auto_play_last_ts: float = 0.0
 
         self._build_ui()
         self._remove_focus_ring()
         self._setup_logging()
+        self.after(50, self._drain_pending_calls)
         self.bind_all("<Button-1>", self._on_global_click, add="+")
 
     def _on_global_click(self, event) -> None:
@@ -1853,6 +1884,10 @@ class App(tk.Tk):
         _recursive(self)
 
     def _on_close(self) -> None:
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
         if self._current_log_file:
             _merge_session_to_history(self._current_log_file)
         self.destroy()
@@ -2358,6 +2393,9 @@ class App(tk.Tk):
                 if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
                     cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
+            if "ffplay" in stem:
+                cmd.insert(1, "-nostats")
+
             log.debug("手动播放 cmd: %s", cmd)
             proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
             _log_stderr(proc, f"[手动 {player_name}] ")
@@ -2485,11 +2523,11 @@ class App(tk.Tk):
         if self._player_proc and self._player_proc.poll() is None:
             try:
                 self._player_proc.terminate()
-                self._player_proc.wait(timeout=3)
+                self._player_proc.wait(timeout=1)
             except Exception:
                 try:
                     self._player_proc.kill()
-                    self._player_proc.wait(timeout=2)
+                    self._player_proc.wait(timeout=1)
                 except Exception:
                     pass
             log.info("自动播放进程已终止")
@@ -2499,11 +2537,6 @@ class App(tk.Tk):
         self._config["auto_play"] = self._auto_play_var.get()
         self._config["auto_play_player"] = self._auto_play_player_var.get()
         _save_config(self._config)
-        if self._auto_play_var.get():
-            player_name = self._auto_play_player_var.get()
-            url = self._url_var.get()
-            if player_name and url:
-                self._launch_auto_player(player_name, url)
 
     def _save_debounce_settings(self) -> None:
         try:
@@ -2636,8 +2669,8 @@ class App(tk.Tk):
                 name=name, port=ports.get("dlna", 9090),
                 airplay_port=ports.get("airplay", 9091), cast_port=ports.get("cast", 8009),
                 protocols=protocols, stop_event=self._stop_event,
-                on_url=lambda u: self.after(0, self._on_url, u),
-                on_play=lambda: self.after(0, self._on_auto_play),
+                on_url=lambda u: self._call_ui(self._on_url, u),
+                on_play=lambda: self._call_ui(self._on_auto_play),
                 audio_output=audio_output, audio_duration=audio_duration,
                 bind_ip=bind_ip or None,
                 continuous=self._continuous_var.get(),
@@ -2646,18 +2679,37 @@ class App(tk.Tk):
                 pass
         except Exception as exc:
             log.error("捕获失败: %s", exc)
-            self.after(0, self._show_status, f"错误: {exc}", "red")
+            self._call_ui(self._show_status, f"错误: {exc}", "red")
         finally:
-            self.after(0, self._set_running, False)
+            self._call_ui(self._set_running, False)
 
     def _on_url(self, url: str) -> None:
         self._load_url_to_ui(url)
         if self._continuous_var.get():
             self._capture_count += 1
             self._show_status(f"● 持续捕获中 ({self._capture_count})", "green")
+        elif self._auto_play_var.get():
+            player_name = self._auto_play_player_var.get()
+            if player_name and url:
+                self._schedule_auto_play(player_name, url)
+
+    def _schedule_auto_play(self, player_name: str, url: str) -> None:
+        def do_launch():
+            try:
+                now = time.time()
+                if url == self._auto_play_last_url and now - self._auto_play_last_ts < 3.0:
+                    return
+                self._auto_play_last_url = url
+                self._auto_play_last_ts = now
+                self._launch_auto_player(player_name, url)
+            except Exception as exc:
+                log.error("自动播放失败: %s", exc)
+        self.after(100, do_launch)
 
     def _on_auto_play(self) -> None:
         if not self._auto_play_var.get():
+            return
+        if not self._continuous_var.get():
             return
         player_name = self._auto_play_player_var.get()
         url = self._url_var.get()
@@ -2705,7 +2757,7 @@ class App(tk.Tk):
             self._stream_duration = None
         line1, line2 = _format_stream_info(info)
         combined = f"{line1}  {line2}" if line2 else line1
-        self.after(0, self._info_var.set, combined)
+        self._call_ui(self._info_var.set, combined)
 
         # Save to history
         if record_history:
@@ -2800,30 +2852,30 @@ class App(tk.Tk):
                     stderr_lines.append(line.rstrip())
                     info = _parse_ffmpeg_progress(line)
                     if info:
-                        self.after(0, self._update_progress, info, duration)
+                        self._call_ui(self._update_progress, info, duration)
                 proc.wait()
                 if proc.returncode == 0 or proc.returncode == 255:
-                    self.after(0, log.info, "录制完成 → %s", output)
-                    self.after(0, self._rec_status_var.set, f"● 录制完成  {Path(output).name}")
-                    self.after(0, lambda: self._progress_var.set(re.sub(
+                    self._call_ui(log.info, "录制完成 → %s", output)
+                    self._call_ui(self._rec_status_var.set, f"● 录制完成  {Path(output).name}")
+                    self._call_ui(lambda: self._progress_var.set(re.sub(
                         r' \| 速度: [\d.]+x', ' | 速度: 0x', self._progress_var.get()
                     )))
-                    self.after(0, lambda u=url, o=output: _mark_history_record(u, o))
+                    self._call_ui(lambda u=url, o=output: _mark_history_record(u, o))
                 else:
                     for err_line in stderr_lines:
                         if not err_line.startswith(("frame=", "size=", "speed=", "Output", "Stream mapping", "Press", "  ")):
-                            self.after(0, log.warning, "  ffmpeg: %s", err_line)
+                            self._call_ui(log.warning, "  ffmpeg: %s", err_line)
 
-                    self.after(0, log.warning, "录制进程退出，返回码 %d (0x%08X)", proc.returncode, proc.returncode)
-                    self.after(0, lambda: self._rec_status_var.set(f"● 录制失败 {Path(output).name} (返回码 {proc.returncode})"))
+                    self._call_ui(log.warning, "录制进程退出，返回码 %d (0x%08X)", proc.returncode, proc.returncode)
+                    self._call_ui(lambda: self._rec_status_var.set(f"● 录制失败 {Path(output).name} (返回码 {proc.returncode})"))
             except Exception as exc:
-                self.after(0, log.error, "录制失败: %s", exc)
-                self.after(0, self._rec_status_var.set, "● 录制失败")
+                self._call_ui(log.error, "录制失败: %s", exc)
+                self._call_ui(self._rec_status_var.set, "● 录制失败")
             finally:
                 self._record_proc = None
                 self._recording = False
-                self.after(0, lambda: self._stop_rec_btn.configure(state="disabled"))
-                self.after(0, lambda: self._rec_btn.configure(state="normal") if self._url_var.get() else None)
+                self._call_ui(lambda: self._stop_rec_btn.configure(state="disabled"))
+                self._call_ui(lambda: self._rec_btn.configure(state="normal") if self._url_var.get() else None)
 
         threading.Thread(target=_run_record, daemon=True).start()
 
@@ -2888,6 +2940,21 @@ class App(tk.Tk):
                 self._show_status(f"● 已停止 (共捕获 {cnt} 个)", "red")
             else:
                 self._show_status("● 已停止", "red")
+
+    def _call_ui(self, fn: Callable, *args) -> None:
+        self._ui_queue.put((fn, args))
+
+    def _drain_pending_calls(self) -> None:
+        while True:
+            try:
+                fn, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception:
+                pass
+        self.after(50, self._drain_pending_calls)
 
     def _show_status(self, text: str, color: str) -> None:
         self._status_var.set(text)
@@ -2980,6 +3047,13 @@ class App(tk.Tk):
 
 def run() -> None:
     """Entry point for the GUI."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _ft_path = LOG_DIR / f"faulthandler-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        _ft = _ft_path.open("a")
+        faulthandler.dump_traceback_later(45, exit=False, file=_ft)
+    except Exception:
+        pass
     app = App()
     app.mainloop()
 
