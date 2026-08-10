@@ -189,6 +189,61 @@ def _find_player_executable(path_or_cmd: str | dict) -> str | None:
     return None
 
 
+def _find_tool(name: str) -> str | None:
+    """Locate an ffmpeg-family tool (ffmpeg/ffprobe/ffplay).
+
+    Search order:
+      1. config.json optional "ffmpeg_dir" directory
+      2. same directory as any configured player executable
+      3. PATH via shutil.which
+      4. common install locations
+
+    Returns:
+        Full path to the tool executable, or None if not found.
+    """
+    exe_name = f"{name}.exe"
+    try:
+        cfg = _load_config()
+        ffmpeg_dir = cfg.get("ffmpeg_dir", "")
+        if ffmpeg_dir:
+            fp = Path(ffmpeg_dir) / exe_name
+            if fp.is_file():
+                log.debug("_find_tool: %s found via config ffmpeg_dir → %s", name, fp)
+                return str(fp)
+            log.debug("_find_tool: config ffmpeg_dir %s has no %s", ffmpeg_dir, exe_name)
+        for player in (cfg.get("players") or {}).values():
+            path = player.get("path", "") if isinstance(player, dict) else player
+            if not path:
+                continue
+            p = Path(path)
+            if not (p.is_absolute() and p.parent.is_dir()):
+                continue
+            fp = p.parent / exe_name
+            if fp.is_file():
+                log.debug("_find_tool: %s found next to player %s → %s", name, p.name, fp)
+                return str(fp)
+    except Exception:
+        log.debug("_find_tool: config lookup failed", exc_info=True)
+    found = shutil.which(name)
+    if found:
+        log.debug("_find_tool: %s found via PATH → %s", name, found)
+        return found
+    common = [
+        Path(os.environ.get("SystemDrive", "C:")) / "ffmpeg" / "bin",
+        Path("C:/Program Files/ffmpeg/bin"),
+        Path("C:/Program Files (x86)/ffmpeg/bin"),
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "ffmpeg" / "bin",
+        Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin",
+    ]
+    for fp in common:
+        cand = fp / exe_name
+        if cand.is_file():
+            log.debug("_find_tool: %s found at common location %s", name, cand)
+            return str(cand)
+    log.debug("_find_tool: %s not found anywhere", name)
+    return None
+
+
 def _seed_default_players() -> dict[str, str]:
     """Detect common media players on the system.
 
@@ -346,7 +401,7 @@ def _detect_format(url: str) -> tuple[str, str]:
 def _get_duration(url: str) -> tuple[float | None, str]:
     """Get duration of a URL using ffprobe."""
     try:
-        ffprobe = shutil.which("ffprobe")
+        ffprobe = _find_tool("ffprobe")
         if not ffprobe:
             return None, "未知"
         cmd = [
@@ -410,11 +465,14 @@ def _format_size(raw: str) -> str:
 
 
 def _get_stream_info(url: str) -> dict:
-    """Get detailed stream information using ffprobe."""
+    """Get detailed stream information using ffprobe.
+
+    Returns {} on parse failure, or {"error": msg} when ffprobe is unavailable.
+    """
     try:
-        ffprobe = shutil.which("ffprobe")
+        ffprobe = _find_tool("ffprobe")
         if not ffprobe:
-            return {}
+            return {"error": "未找到 ffprobe"}
         cmd = [
             ffprobe, "-v", "quiet", "-print_format", "json",
             "-show_format", "-show_streams", "-allowed_extensions", "ALL",
@@ -495,6 +553,23 @@ def _parse_ffmpeg_progress(line: str) -> dict | None:
     if speed_match:
         info["speed"] = f"{speed_match.group(1)}x"
     return info if info else None
+
+
+def _build_record_cmd(ffmpeg: str, url: str, output: str, duration: float | None = None) -> list[str]:
+    """Build the ffmpeg command line for recording a stream.
+
+    `-fflags nobuffer` is intentionally not used: recent ffmpeg builds (e.g.
+    2026-07 nightly) make `-c copy` recordings empty or truncated with it
+    (0 packets muxed even though input demuxes fine).
+    """
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "info", "-stats",
+           "-thread_queue_size", "512", "-i", url, "-c", "copy"]
+    if url.lower().endswith((".m3u8", ".m3u")):
+        cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+    if duration:
+        cmd += ["-t", str(duration)]
+    cmd += ["-y", output]
+    return cmd
 
 
 # ── Logging handler ──────────────────────────────────────────
@@ -1073,9 +1148,9 @@ class HistoryDialog(tk.Toplevel):
         dialog = RecordDialog(self._parent, url, save_dir)
         result = dialog.show()
         if result:
-            output, duration = result
+            rec_url, output, duration = result
             self.destroy()
-            self._parent._start_recording(url, output, duration)
+            self._parent._start_recording(rec_url, output, duration)
 
     def _clear_history(self) -> None:
         if _ask_yes_no(self, "确认", "确定要清空所有捕获历史记录吗？"):
@@ -1101,7 +1176,12 @@ class RecordDialog(tk.Toplevel):
 
         self._url = url
         self._stream_duration = stream_duration
-        self._result: tuple[str, float | None] | None = None
+        self._result: tuple[str, str, float | None] | None = None
+        self._fmt_touched = False
+        self._dur_token = 0
+        self._dur_queue: queue.Queue[tuple[float | None, str, int]] = queue.Queue()
+        self._url_var = tk.StringVar(value=url)
+        self._poll_after_id = self.after(50, self._poll_duration_queue)
 
         default_ext, _ = _detect_format(url)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1117,6 +1197,14 @@ class RecordDialog(tk.Toplevel):
         scrollable = ScrollableFrame(self)
         scrollable.pack(fill="both", expand=True)
         content = scrollable.inner
+
+        # Stream URL
+        frm_url = ttk.LabelFrame(content, text="流地址", padding=8)
+        frm_url.pack(fill="x", **pad)
+        self._url_entry = ttk.Entry(frm_url, textvariable=self._url_var, width=40)
+        self._url_entry.pack(fill="x")
+        self._url_entry.bind("<KeyRelease>", self._on_url_changed)
+        self._url_entry.bind("<Return>", self._on_url_changed)
 
         # Save directory
         frm_dir = ttk.LabelFrame(content, text="存储目录", padding=8)
@@ -1231,10 +1319,55 @@ class RecordDialog(tk.Toplevel):
             self._update_preview()
 
     def _on_format_change(self, event: tk.Event) -> None:
+        self._fmt_touched = True
         idx = self._fmt_combo.current()
         if 0 <= idx < len(_FORMAT_OPTIONS):
             self._ext_var.set(_FORMAT_OPTIONS[idx][0])
             self._update_preview()
+
+    def _on_url_changed(self, event: tk.Event = None) -> None:
+        new_url = self._url_var.get().strip()
+        if not new_url:
+            return
+        if not self._fmt_touched:
+            new_ext, _ = _detect_format(new_url)
+            self._ext_var.set(new_ext)
+            for i, (ext, _) in enumerate(_FORMAT_OPTIONS):
+                if ext == new_ext:
+                    self._fmt_combo.current(i)
+                    break
+            self._update_preview()
+        self._hint_var.set("获取流时长中...")
+        self._warning_var.set("")
+        self._dur_token += 1
+        token = self._dur_token
+        threading.Thread(target=self._refresh_duration, args=(new_url, token), daemon=True).start()
+
+    def _refresh_duration(self, url: str, token: int) -> None:
+        duration, text = _get_duration(url)
+        if token == self._dur_token:
+            self._dur_queue.put((duration, text, token))
+
+    def _poll_duration_queue(self) -> None:
+        try:
+            while True:
+                duration, text, token = self._dur_queue.get_nowait()
+                self._apply_duration(duration, text, token)
+        except queue.Empty:
+            pass
+        except Exception:
+            log.debug("RecordDialog: duration poll failed", exc_info=True)
+        self._poll_after_id = self.after(50, self._poll_duration_queue)
+
+    def _apply_duration(self, duration: float | None, text: str, token: int) -> None:
+        if token != self._dur_token:
+            return
+        self._stream_duration = duration
+        if duration and duration > 0:
+            self._hint_var.set(f"流时长: {text}")
+        else:
+            self._hint_var.set("直播流，建议设置时长")
+        self._update_duration_warning()
 
     def _update_preview(self) -> None:
         save_dir, filename, ext = self._dir_var.get().strip(), self._name_var.get().strip(), self._ext_var.get()
@@ -1246,6 +1379,10 @@ class RecordDialog(tk.Toplevel):
 
     def _confirm(self) -> None:
         save_dir, filename, ext = self._dir_var.get().strip(), self._name_var.get().strip(), self._ext_var.get()
+        url = self._url_var.get().strip()
+        if not url:
+            _show_warning(self, "提示", "请输入流地址")
+            return
         if not save_dir:
             _show_warning(self, "提示", "请选择存储目录")
             return
@@ -1255,15 +1392,19 @@ class RecordDialog(tk.Toplevel):
         h, m, s = self._hour_wheel.get(), self._min_wheel.get(), self._sec_wheel.get()
         duration = h * 3600 + m * 60 + s if (h > 0 or m > 0 or s > 0) else None
         Path(save_dir).mkdir(parents=True, exist_ok=True)
-        self._result = (str(Path(save_dir) / f"{filename}{ext}"), duration)
+        self._result = (url, str(Path(save_dir) / f"{filename}{ext}"), duration)
         self.destroy()
 
-    def show(self) -> tuple[str, float | None] | None:
+    def show(self) -> tuple[str, str, float | None] | None:
         self.wait_window()
         return self._result
 
     def destroy(self) -> None:
         self._parent.focus_set()
+        try:
+            self.after_cancel(self._poll_after_id)
+        except Exception:
+            pass
         super().destroy()
 
 
@@ -2656,8 +2797,8 @@ class App(tk.Tk):
         dialog = RecordDialog(self, url, save_dir, stream_duration=self._stream_duration)
         result = dialog.show()
         if result:
-            output, duration = result
-            self._start_recording(url, output, duration)
+            rec_url, output, duration = result
+            self._start_recording(rec_url, output, duration)
 
     def _capture_thread_fn(
         self, name: str, ports: dict[str, int], protocols: list[str],
@@ -2738,6 +2879,14 @@ class App(tk.Tk):
 
     def _fetch_stream_info(self, url: str, record_history: bool = True) -> None:
         data = _get_stream_info(url)
+        if data.get("error"):
+            log.warning("流信息解析不可用: %s", data["error"])
+            self._stream_duration = None
+            self._call_ui(self._info_var.set,
+                          "流信息: 解析失败（未找到 ffprobe，可在 config.json 配置 ffmpeg_dir，或安装 ffmpeg 到 PATH）")
+            if record_history:
+                _add_history_record(url, {}, remark=self._remark_var.get())
+            return
         info = _parse_stream_info(data)
         duration_str = info.get("duration", "未知")
         if duration_str not in ("未知", "直播中"):
@@ -2820,18 +2969,11 @@ class App(tk.Tk):
         self.focus_set()
 
     def _start_recording(self, url: str, output: str, duration: float | None = None) -> None:
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = _find_tool("ffmpeg")
         if not ffmpeg:
-            _show_error(self, "错误", "未找到 ffmpeg，请先安装并添加到 PATH")
+            _show_error(self, "错误", "未找到 ffmpeg/ffprobe，请在 config.json 配置 ffmpeg_dir，或安装 ffmpeg 到 PATH")
             return
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "info", "-stats",
-               "-fflags", "nobuffer", "-thread_queue_size", "512",
-               "-i", url, "-c", "copy"]
-        if url.lower().endswith((".m3u8", ".m3u")):
-            cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
-        if duration:
-            cmd.extend(["-t", str(duration)])
-        cmd.extend(["-y", output])
+        cmd = _build_record_cmd(ffmpeg, url, output, duration)
         log.info("开始录制 → %s", output)
         self._recording = True
         self._stop_rec_btn.configure(state="normal")
