@@ -1178,6 +1178,7 @@ class RecordDialog(tk.Toplevel):
         self._stream_duration = stream_duration
         self._result: tuple[str, str, float | None] | None = None
         self._fmt_touched = False
+        self._dur_touched = False
         self._dur_token = 0
         self._dur_queue: queue.Queue[tuple[float | None, str, int]] = queue.Queue()
         self._url_var = tk.StringVar(value=url)
@@ -1247,7 +1248,7 @@ class RecordDialog(tk.Toplevel):
 
         frm_wheels = ttk.Frame(frm_dur)
         frm_wheels.pack(fill="x", pady=4)
-        self._hour_wheel = WheelSelector(frm_wheels, min_val=0, max_val=23)
+        self._hour_wheel = WheelSelector(frm_wheels, min_val=0, max_val=99)
         self._hour_wheel.pack(side="left", padx=(20, 2))
         ttk.Label(frm_wheels, text="时", font=("Microsoft YaHei", 10)).pack(side="left", padx=(0, 10))
         self._min_wheel = WheelSelector(frm_wheels, min_val=0, max_val=59)
@@ -1285,11 +1286,17 @@ class RecordDialog(tk.Toplevel):
         self._update_preview()
         self._update_duration_display()
 
+        if stream_duration and stream_duration > 0:
+            self._prefill_duration(stream_duration)
+
         self.update_idletasks()
         dialog_w, dialog_h = 400, 600
         x = parent.winfo_x() + (parent.winfo_width() - dialog_w) // 2
         y = parent.winfo_y() + (parent.winfo_height() - dialog_h) // 2
         self.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
+
+        if not (stream_duration and stream_duration > 0):
+            self._on_url_changed()
 
     def _set_duration(self, h: int, m: int, s: int) -> None:
         self._hour_wheel.set(h)
@@ -1298,6 +1305,7 @@ class RecordDialog(tk.Toplevel):
         self._on_wheel_change()
 
     def _on_wheel_change(self) -> None:
+        self._dur_touched = True
         self._update_duration_display()
         self._update_duration_warning()
 
@@ -1365,8 +1373,20 @@ class RecordDialog(tk.Toplevel):
         self._stream_duration = duration
         if duration and duration > 0:
             self._hint_var.set(f"流时长: {text}")
+            if not self._dur_touched:
+                self._prefill_duration(duration)
         else:
             self._hint_var.set("直播流，建议设置时长")
+        self._update_duration_warning()
+
+    def _prefill_duration(self, seconds: float) -> None:
+        total = int(seconds)
+        if total >= 360000:
+            return
+        self._hour_wheel.set(total // 3600)
+        self._min_wheel.set(total % 3600 // 60)
+        self._sec_wheel.set(total % 60)
+        self._update_duration_display()
         self._update_duration_warning()
 
     def _update_preview(self) -> None:
