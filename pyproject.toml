@@ -11,6 +11,7 @@ dependencies = [
     "protobuf>=4.25.0",
     "cryptography>=41.0.0",
     "pycryptodome>=3.23.0",
+    "pywin32>=306",
 ]
 authors = [{ name = "Muchen" }]
 keywords = [
