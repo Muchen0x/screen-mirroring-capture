@@ -1070,6 +1070,11 @@ class HistoryDialog(tk.Toplevel):
             menu.add_cascade(label="播放", menu=play_menu)
 
         menu.add_command(label="删除", command=self._delete_selected)
+
+        if self._parent._playlist_urls:
+            menu.add_separator()
+            menu.add_command(label="清空播放队列", command=self._parent._clear_queue)
+
         menu.tk_popup(event.x_root, event.y_root)
 
     def _copy_selected_url(self) -> None:
@@ -1995,6 +2000,7 @@ class App(tk.Tk):
         self._capture_thread: threading.Thread | None = None
         self._record_proc: subprocess.Popen | None = None
         self._player_proc: subprocess.Popen | None = None
+        self._mpv_generation: int = 0
         self._stream_duration: float | None = None
         self._config = _load_config()
         self._history_loaded = False
@@ -2235,6 +2241,7 @@ class App(tk.Tk):
 
         self._layout_player_buttons()
         self._player_buttons_frame.bind("<Configure>", lambda e: self._layout_player_buttons())
+        self._player_buttons_frame.bind("<Button-3>", self._on_player_buttons_right_click)
 
         row_auto = ttk.Frame(frm_capture)
         row_auto.pack(fill="x", pady=(4, 0))
@@ -2472,8 +2479,6 @@ class App(tk.Tk):
             _show_error(self, "错误", f"启动播放器 {player_name} 失败")
 
     def _launch_manual_player(self, player_name: str, url: str) -> bool:
-        """Launch player for manual click. Returns True on success.
-        Does NOT kill old processes and does NOT manage auto-play state."""
         players = self._config.get("players", {})
         entry = players.get(player_name)
         if not entry:
@@ -2484,21 +2489,8 @@ class App(tk.Tk):
         if not player_path:
             return False
 
-        # Kill previous player if configured
-        if self._manual_kill_prev_var.get():
-            self._stop_player()
-            for proc in self._manual_player_procs:
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=2)
-                    except Exception:
-                        pass
-            self._manual_player_procs.clear()
-
         stem = Path(player_path).stem.lower()
 
-        # Resolve protocol
         if protocol == "auto":
             is_playlist = self._is_playlist_stem(stem)
             log.info("协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
@@ -2509,48 +2501,54 @@ class App(tk.Tk):
             is_playlist = False
             log.info("协议决策: %s → direct", protocol)
 
-        # IPC: try append to existing pipe
-        if protocol == "ipc" and "mpv" in stem and self._ipc_pipe:
-            log.debug("IPC 尝试追加: pipe=%s url=%s", self._ipc_pipe, url)
-            if self._mpv_ipc_append(url):
-                log.info("手动播放(IPC) %s: %s", player_name, url)
+        self._playlist_urls.append(url)
+
+        # IPC 分支：复用已有 mpv 进程，追加不中断
+        if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
+            log.debug("手动播放 IPC 追加: pipe=%s url=%s", self._ipc_pipe, url)
+            self._write_playlist()
+            if self._mpv_ipc_append(url, "append"):
+                log.info("手动播放(IPC append) %s: %s", player_name, url)
                 return True
-            log.debug("IPC 追加失败，回退到新进程")
+            log.warning("IPC 追加失败，回退到新进程 (pipe=%s)", self._ipc_pipe)
+
+        # non-mpv 非 IPC 模式：manual_kill_prev 控制是否杀旧进程
+        if not (is_playlist and "mpv" in stem):
+            if self._manual_kill_prev_var.get():
+                self._stop_player()
+                for proc in self._manual_player_procs:
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                self._manual_player_procs.clear()
+
+        # mpv 非 IPC 模式：终止旧 mpv 进程再启动新的
+        if is_playlist and "mpv" in stem and self._player_proc and self._player_proc.poll() is None:
+            self._stop_player()
 
         try:
             if is_playlist:
-                playlist_path = Path(tempfile.gettempdir()) / f"smc_manual_{os.getpid()}_{id(url)}.m3u"
-                playlist_path.write_text(f"#EXTM3U\n{url}\n", encoding="utf-8")
-                log.debug(".m3u 已写入 %s: %s", playlist_path, url)
+                self._write_playlist()
+                log.debug("手动播放: .m3u %s 含 %d 个 URL", self._playlist_path, len(self._playlist_urls))
                 if "mpv" in stem:
-                    pipe_name = f"smc-mpv-manual-{os.getpid()}-{id(url)}"
-                    log.debug("手动播放 IPC pipe: %s", pipe_name)
-                    cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{pipe_name}", str(playlist_path)]
-                    self._ipc_pipe = pipe_name
+                    if not self._ipc_pipe or not (self._player_proc and self._player_proc.poll() is None):
+                        pipe_name = f"smc-mpv-{os.getpid()}"
+                        self._ipc_pipe = pipe_name
+                    cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{self._ipc_pipe}", "--idle=yes", "--keep-open=yes", str(self._playlist_path)]
+                    self._player_proc = self._spawn_mpv(cmd, f"手动 {player_name}")
                 else:
-                    cmd = [player_path, str(playlist_path)]
-                if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
-                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
-                elif "mpv" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
+                    cmd = [player_path, str(self._playlist_path)]
+                    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+                    _log_stderr(proc, f"[手动 {player_name}] ")
+                    self._manual_player_procs.append(proc)
             else:
                 cmd = [player_path, url]
-                if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
-                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
-                elif "mpv" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
+                proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+                _log_stderr(proc, f"[手动 {player_name}] ")
+                self._manual_player_procs.append(proc)
 
-            if "ffplay" in stem:
-                cmd.insert(1, "-nostats")
-
-            log.debug("手动播放 cmd: %s", cmd)
-            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
-            _log_stderr(proc, f"[手动 {player_name}] ")
-            self._manual_player_procs.append(proc)
             log.info("手动播放 %s: %s", player_name, url)
             return True
         except Exception as exc:
@@ -2558,7 +2556,6 @@ class App(tk.Tk):
             return False
 
     def _launch_auto_player(self, player_name: str, url: str) -> bool:
-        """Launch or append to the auto-play player. Returns True on success."""
         players = self._config.get("players", {})
         entry = players.get(player_name)
         if not entry:
@@ -2571,7 +2568,6 @@ class App(tk.Tk):
 
         stem = Path(player_path).stem.lower()
 
-        # Resolve protocol
         if protocol == "auto":
             is_playlist = self._is_playlist_stem(stem)
             log.info("协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
@@ -2582,57 +2578,43 @@ class App(tk.Tk):
             is_playlist = False
             log.info("协议决策: %s → direct", protocol)
 
-        # IPC: try append when same player and alive
-        if protocol == "ipc" and "mpv" in stem and self._player_proc and self._player_proc.poll() is None and player_name == self._last_player_name:
-            log.debug("自动播放 IPC 尝试追加: pipe=%s url=%s", self._ipc_pipe, url)
-            if self._mpv_ipc_append(url):
-                self._playlist_urls.clear()
-                self._playlist_urls.append(url)
-                self._write_playlist()
-                log.info("自动播放(IPC) %s: %s", player_name, url)
-                return True
-            log.debug("自动播放 IPC 追加失败，将重启进程")
+        self._playlist_urls.append(url)
+        log.info("=== _launch_auto_player [%s] url=%s 队列长度=%d ===", player_name, url, len(self._playlist_urls))
 
-        # Always kill old process before starting fresh
-        log.debug("自动播放: 终止旧进程")
-        self._stop_player()
-        self._playlist_urls.clear()
-        if player_name != self._last_player_name:
-            self._ipc_pipe = ""
+        # IPC 分支：复用已有 mpv 进程，追加不中断
+        if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
+            log.info("IPC 追加尝试: pipe=%s gen=%d url=%s", self._ipc_pipe, getattr(self, "_mpv_generation", 0), url)
+            self._write_playlist()
+            if self._mpv_ipc_append(url, "append"):
+                log.info("自动播放(IPC append 成功) %s: %s 队列=%d", player_name, url, len(self._playlist_urls))
+                return True
+            log.warning("IPC 追加失败，将重启进程 (pipe=%s)", self._ipc_pipe)
+
+        # 终止旧进程
+        if self._player_proc and self._player_proc.poll() is None:
+            log.info("fallback: 终止旧 mpv (pid=%s) gen=%d", self._player_proc.pid, getattr(self, "_mpv_generation", 0))
+            self._stop_player()
 
         self._last_player_name = player_name
-        self._playlist_urls.append(url)
 
         try:
             if is_playlist:
                 self._write_playlist()
-                log.debug("自动播放: .m3u 文件 %s 包含 %d 个 URL", self._playlist_path, len(self._playlist_urls))
+                log.info("fallback: 重新启动 mpv, 队列=%d 文件=%s", len(self._playlist_urls), self._playlist_path)
                 if "mpv" in stem:
                     pipe_name = f"smc-mpv-{os.getpid()}"
                     self._ipc_pipe = pipe_name
-                    log.debug("自动播放 IPC pipe: %s", pipe_name)
-                    cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{pipe_name}", str(self._playlist_path)]
+                    cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{pipe_name}", "--idle=yes", "--keep-open=yes", str(self._playlist_path)]
+                    self._player_proc = self._spawn_mpv(cmd, f"自动 {player_name}")
                 else:
                     cmd = [player_path, str(self._playlist_path)]
-                has_hls = any(u.lower().endswith((".m3u8", ".m3u")) for u in self._playlist_urls)
-                if "ffplay" in stem and has_hls:
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
-                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
-                elif "mpv" in stem and has_hls:
-                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
+                    self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+                    _log_stderr(self._player_proc, f"[自动 {player_name}] ")
             else:
                 cmd = [player_path, url]
-                if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
-                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
-                elif "mpv" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
+                self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+                _log_stderr(self._player_proc, f"[自动 {player_name}] ")
 
-            log.debug("自动播放 cmd: %s", cmd)
-            self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
-            _log_stderr(self._player_proc, f"[自动 {player_name}] ")
             log.info("自动播放 %s: %s", player_name, url)
             return True
         except Exception as exc:
@@ -2651,20 +2633,31 @@ class App(tk.Tk):
             lines.append(f"{url}\n")
         self._playlist_path.write_text("".join(lines), encoding="utf-8")
 
-    def _mpv_ipc_append(self, url: str) -> bool:
+    def _mpv_ipc_append(self, url: str, mode: str = "append") -> bool:
         if not self._ipc_pipe:
+            log.debug("IPC append 失败: _ipc_pipe 为空")
             return False
+        pipe_path = f"\\\\.\\pipe\\{self._ipc_pipe}"
         try:
             import win32file
             import win32pipe
             import pywintypes
-            handle = win32file.CreateFile(
-                f"\\\\.\\pipe\\{self._ipc_pipe}",
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, 0, None
-            )
-            data = json.dumps({"command": ["loadfile", url]}) + "\n"
-            win32file.WriteFile(handle, data.encode("utf-8"))
+            try:
+                handle = win32file.CreateFile(
+                    pipe_path,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0, None, win32file.OPEN_EXISTING, 0, None
+                )
+            except pywintypes.error as e:
+                log.warning("IPC CreateFile 失败 pipe=%s: errno=%s msg=%s", self._ipc_pipe, e.args[0], e.args[1])
+                return False
+            data = json.dumps({"command": ["loadfile", url, mode]}) + "\n"
+            try:
+                win32file.WriteFile(handle, data.encode("utf-8"))
+            except pywintypes.error as e:
+                log.warning("IPC WriteFile 失败 pipe=%s url=%s: errno=%s msg=%s", self._ipc_pipe, url, e.args[0], e.args[1])
+                win32file.CloseHandle(handle)
+                return False
             # Read response to prevent pipe buffer from blocking mpv
             try:
                 mode = win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_NOWAIT
@@ -2674,8 +2667,10 @@ class App(tk.Tk):
             except Exception:
                 pass
             win32file.CloseHandle(handle)
+            log.debug("IPC append 成功: pipe=%s url=%s", self._ipc_pipe, url)
             return True
-        except Exception:
+        except Exception as e:
+            log.warning("IPC append 异常: pipe=%s url=%s: %s", self._ipc_pipe, url, e)
             return False
 
     def _stop_player(self) -> None:
@@ -2691,6 +2686,61 @@ class App(tk.Tk):
                     pass
             log.info("自动播放进程已终止")
         self._player_proc = None
+        self._mpv_generation = getattr(self, "_mpv_generation", 0) + 1
+
+    def _reset_mpv_state(self) -> None:
+        import traceback
+        log.warning("=== _reset_mpv_state 被调用 === 调用栈:\n%s", "".join(traceback.format_stack()))
+        self._playlist_urls.clear()
+        self._ipc_pipe = ""
+        self._playlist_path = None
+        self._player_proc = None
+        self._manual_player_procs.clear()
+        log.info("mpv 共享状态已重置")
+
+    def _clear_queue(self) -> None:
+        if self._player_proc and self._player_proc.poll() is None:
+            try:
+                self._player_proc.terminate()
+                self._player_proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self._player_proc.kill()
+                except Exception:
+                    pass
+        for proc in self._manual_player_procs:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        self._reset_mpv_state()
+        _show_toast(self, "播放队列已清空")
+
+    def _spawn_mpv(self, cmd: list[str], name: str) -> subprocess.Popen:
+        self._mpv_generation = getattr(self, "_mpv_generation", 0) + 1
+        gen = self._mpv_generation
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+        _log_stderr(proc, f"[{name} gen={gen}] ")
+
+        def _watch():
+            proc.wait()
+            log.info("mpv gen=%d 进程退出 (pid=%d)，调度主线程检查", gen, proc.pid)
+            self.after(0, lambda: self._on_mpv_exit(gen))
+
+        threading.Thread(target=_watch, daemon=True).start()
+        return proc
+
+    def _on_mpv_exit(self, gen: int) -> None:
+        current = getattr(self, "_mpv_generation", 0)
+        if current == gen:
+            log.warning("mpv gen=%d 退出 (pid=%d), 队列长度=%d, 保留队列仅清管道引用",
+                        gen, getattr(self, "_player_proc", None) and self._player_proc.pid or 0,
+                        len(self._playlist_urls))
+            self._player_proc = None
+            self._ipc_pipe = ""
+        else:
+            log.debug("mpv 旧进程 gen=%d 退出，忽略（当前 gen=%d）", gen, current)
 
     def _save_auto_play_settings(self) -> None:
         self._config["auto_play"] = self._auto_play_var.get()
@@ -2719,6 +2769,13 @@ class App(tk.Tk):
             self._do_layout_player_buttons()
         finally:
             self._layout_in_progress = False
+
+    def _on_player_buttons_right_click(self, event: tk.Event) -> None:
+        if not self._playlist_urls:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="清空播放队列", command=self._clear_queue)
+        menu.tk_popup(event.x_root, event.y_root)
 
     def _do_layout_player_buttons(self) -> None:
         frame = self._player_buttons_frame
@@ -2822,6 +2879,7 @@ class App(tk.Tk):
         self._auto_play_combo.configure(values=names)
         if self._auto_play_player_var.get() not in names:
             self._auto_play_player_var.set("")
+        self._reset_mpv_state()
 
     def _open_player_dialog(self) -> None:
         """Open the player management dialog."""
