@@ -565,7 +565,9 @@ def _build_record_cmd(ffmpeg: str, url: str, output: str, duration: float | None
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "info", "-stats",
            "-thread_queue_size", "512", "-i", url, "-c", "copy"]
     if url.lower().endswith((".m3u8", ".m3u")):
-        cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+        cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+                    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+                    "-reconnect_max_retries", "5", "-http_persistent", "0"]
     if duration:
         cmd += ["-t", str(duration)]
     cmd += ["-y", output]
@@ -2010,6 +2012,7 @@ class App(tk.Tk):
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
         self._auto_play_last_url: str = ""
         self._auto_play_last_ts: float = 0.0
+        self._layout_in_progress: bool = False
 
         self._build_ui()
         self._remove_focus_ring()
@@ -2228,28 +2231,7 @@ class App(tk.Tk):
         self._player_buttons: dict[str, ttk.Button] = {}
         self._player_btn_list: list[ttk.Widget] = []
 
-        self._player_lbl = ttk.Label(self._player_buttons_frame, text="播放器:")
-        self._player_lbl.pack(side="left")
-        self._player_btn_list.append(self._player_lbl)
-
-        players = self._config.get("players", {})
-        for name in players:
-            btn = ttk.Button(self._player_buttons_frame, text=f"▶ {name}",
-                             command=lambda n=name: self._open_in_player(n),
-                             state="disabled")
-            btn.pack(side="left", padx=2)
-            self._player_buttons[name] = btn
-            self._player_btn_list.append(btn)
-
         self._edit_btn = ttk.Button(self._player_buttons_frame, text="编辑", command=self._open_player_dialog)
-        self._edit_btn.pack(side="left", padx=(4, 0))
-        self._player_btn_list.append(self._edit_btn)
-
-        self._player_buttons_frame.update_idletasks()
-        self._player_btn_widths = [w.winfo_width() for w in self._player_btn_list]
-
-        for w in self._player_btn_list:
-            w.pack_forget()
 
         self._layout_player_buttons()
         self._player_buttons_frame.bind("<Configure>", lambda e: self._layout_player_buttons())
@@ -2548,11 +2530,19 @@ class App(tk.Tk):
                 else:
                     cmd = [player_path, str(playlist_path)]
                 if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
+                elif "mpv" in stem and url.lower().endswith((".m3u8", ".m3u")):
+                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
             else:
                 cmd = [player_path, url]
                 if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
+                elif "mpv" in stem and url.lower().endswith((".m3u8", ".m3u")):
+                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
 
             if "ffplay" in stem:
                 cmd.insert(1, "-nostats")
@@ -2626,11 +2616,19 @@ class App(tk.Tk):
                     cmd = [player_path, str(self._playlist_path)]
                 has_hls = any(u.lower().endswith((".m3u8", ".m3u")) for u in self._playlist_urls)
                 if "ffplay" in stem and has_hls:
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
+                elif "mpv" in stem and has_hls:
+                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
             else:
                 cmd = [player_path, url]
                 if "ffplay" in stem and url.lower().endswith((".m3u8", ".m3u")):
-                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+                    cmd[1:1] = ["-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+                                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+                                "-reconnect_max_retries", "5", "-http_persistent", "0"]
+                elif "mpv" in stem and url.lower().endswith((".m3u8", ".m3u")):
+                    cmd[1:1] = ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=2,reconnect_max_retries=5,http_persistent=0"]
 
             log.debug("自动播放 cmd: %s", cmd)
             self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
@@ -2714,87 +2712,108 @@ class App(tk.Tk):
         _save_config(self._config)
 
     def _layout_player_buttons(self) -> None:
+        if self._layout_in_progress:
+            return
+        self._layout_in_progress = True
+        try:
+            self._do_layout_player_buttons()
+        finally:
+            self._layout_in_progress = False
+
+    def _do_layout_player_buttons(self) -> None:
         frame = self._player_buttons_frame
         frame.update_idletasks()
         available = frame.winfo_width()
         if available < 20:
             return
-        available -= 8
 
-        gaps = []
-        for i in range(len(self._player_btn_list)):
-            if i == 0:
-                gaps.append(0)
-            elif i == len(self._player_btn_list) - 1:
-                gaps.append(2)
-            else:
-                gaps.append(2)
+        # Measure button widths using temporary hidden widgets (only if not cached)
+        if not hasattr(self, "_player_btn_widths") or not self._player_btn_widths:
+            _temp_lbl = ttk.Label(frame, text="播放器:")
+            _temp_lbl.pack(side="left")
+            _temp_lbl.update_idletasks()
+            lbl_width = _temp_lbl.winfo_width()
+            _temp_lbl.destroy()
 
-        total = sum(self._player_btn_widths[i] + gaps[i] * 2 for i in range(len(self._player_btn_list)))
+            players = self._config.get("players", {})
+            player_widths = []
+            for name in players:
+                btn = ttk.Button(frame, text=f"▶ {name}", state="disabled")
+                btn.pack(side="left", padx=2)
+                btn.update_idletasks()
+                player_widths.append(btn.winfo_width())
+                btn.destroy()
 
-        for w in self._player_btn_list:
-            w.pack_forget()
-            w.grid_forget()
+            _temp_edit = ttk.Button(frame, text="编辑")
+            _temp_edit.pack(side="left", padx=(4, 0))
+            _temp_edit.update_idletasks()
+            edit_width = _temp_edit.winfo_width()
+            _temp_edit.destroy()
 
-        if total <= available:
-            for i, w in enumerate(self._player_btn_list):
-                if i == 0:
-                    w.pack(side="left")
-                elif i == len(self._player_btn_list) - 1:
-                    w.pack(side="left", padx=(4, 0))
-                else:
-                    w.pack(side="left", padx=2)
-            return
+            self._player_btn_widths = {
+                "label": lbl_width,
+                "players": {name: w for name, w in zip(players.keys(), player_widths)},
+                "edit": edit_width,
+            }
+        lbl_width = self._player_btn_widths["label"]
+        player_widths_dict = self._player_btn_widths["players"]
+        edit_width = self._player_btn_widths["edit"]
 
-        row = 0
-        col = 0
+        # Build width list: [label, player1, player2, ..., edit]
+        players = self._config.get("players", {})
+        all_widths = [lbl_width] + [player_widths_dict.get(n, 80) for n in players] + [edit_width]
+        all_names = ["__label__"] + list(players.keys()) + ["__edit__"]
+
+        # Calculate row groupings
+        rows: list[list[int]] = []
+        current_row: list[int] = []
         x = 0
-        for i, w in enumerate(self._player_btn_list):
-            gap = gaps[i]
-            space = self._player_btn_widths[i] + gap * 2
-            if x + space > available and col > 0:
-                row += 1
-                col = 0
+        for idx, w in enumerate(all_widths):
+            gap = 4 if idx > 0 else 0
+            space = w + gap
+            if current_row and x + space > available:
+                rows.append(current_row)
+                current_row = []
                 x = 0
-            w.grid(row=row, column=col, sticky="w", padx=(gap, gap))
+            current_row.append(idx)
             x += space
-            col += 1
+        if current_row:
+            rows.append(current_row)
+
+        # Destroy all existing children
+        for child in list(frame.winfo_children()):
+            child.destroy()
+        self._player_btn_list.clear()
+
+        # Create real widgets inside row frames
+        state = "normal" if self._url_var.get() else "disabled"
+        for row_indices in rows:
+            row_frame = ttk.Frame(frame)
+            row_frame.pack(anchor="w", pady=1)
+            for idx in row_indices:
+                name = all_names[idx]
+                if name == "__label__":
+                    lbl = ttk.Label(row_frame, text="播放器:")
+                    lbl.pack(side="left")
+                    self._player_btn_list.append(lbl)
+                elif name == "__edit__":
+                    self._edit_btn = ttk.Button(row_frame, text="编辑", command=self._open_player_dialog)
+                    self._edit_btn.pack(side="left", padx=(4, 0))
+                    self._player_btn_list.append(self._edit_btn)
+                else:
+                    btn = ttk.Button(row_frame, text=f"▶ {name}",
+                                     command=lambda n=name: self._open_in_player(n),
+                                     state=state)
+                    btn.pack(side="left", padx=2)
+                    self._player_buttons[name] = btn
+                    self._player_btn_list.append(btn)
 
     def _rebuild_player_buttons(self) -> None:
         """Rebuild the player buttons in the capture card."""
         if not hasattr(self, "_player_buttons_frame"):
             return
-        for btn in self._player_buttons.values():
-            btn.destroy()
         self._player_buttons.clear()
-        self._player_btn_list.clear()
-
-        if hasattr(self, "_player_lbl"):
-            self._player_lbl.destroy()
-
-        self._player_lbl = ttk.Label(self._player_buttons_frame, text="播放器:")
-        self._player_lbl.pack(side="left")
-        self._player_btn_list.append(self._player_lbl)
-
-        state = "normal" if self._url_var.get() else "disabled"
-        players = self._config.get("players", {})
-        for name in players:
-            btn = ttk.Button(self._player_buttons_frame, text=f"▶ {name}",
-                             command=lambda n=name: self._open_in_player(n),
-                             state=state)
-            btn.pack(side="left", padx=2)
-            self._player_buttons[name] = btn
-            self._player_btn_list.append(btn)
-
-        self._edit_btn.pack(side="left", padx=(4, 0))
-        self._player_btn_list.append(self._edit_btn)
-
-        self._player_buttons_frame.update_idletasks()
-        self._player_btn_widths = [w.winfo_width() for w in self._player_btn_list]
-
-        for w in self._player_btn_list:
-            w.pack_forget()
-
+        self._player_btn_widths = None
         self._layout_player_buttons()
 
     def _on_players_changed(self) -> None:
