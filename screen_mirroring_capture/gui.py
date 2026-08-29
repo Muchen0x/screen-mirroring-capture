@@ -518,6 +518,23 @@ def _parse_stream_info(data: dict) -> dict:
     return info
 
 
+def _build_playlist_item(url: str, remark: str = "") -> dict:
+    """Build a playlist item dict with stream metadata."""
+    data = _get_stream_info(url)
+    info = _parse_stream_info(data) if data and "error" not in data else {}
+    return {
+        "url": url,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "duration": info.get("duration", "未知"),
+        "resolution": info.get("resolution", ""),
+        "video_codec": info.get("video_codec", ""),
+        "audio_codec": info.get("audio_codec", ""),
+        "bitrate": info.get("bitrate", ""),
+        "fps": info.get("fps", ""),
+        "remark": remark,
+    }
+
+
 def _format_stream_info(info: dict) -> tuple[str, str]:
     """Format stream info into two display lines."""
     parts1 = []
@@ -954,6 +971,8 @@ class HistoryDialog(tk.Toplevel):
         ttk.Button(frm_btn, text="清空捕获历史", command=self._clear_history).pack(side="left", padx=4)
         self._confirm_btn = ttk.Button(frm_btn, text="加载", command=self._confirm_and_close, width=8, state="disabled")
         self._confirm_btn.pack(side="right", padx=4)
+        self._add_to_playlist_btn = ttk.Button(frm_btn, text="加入播放列表", command=self._add_to_playlist, width=10, state="disabled")
+        self._add_to_playlist_btn.pack(side="right", padx=4)
         ttk.Button(frm_btn, text="关闭", command=self.destroy, width=8).pack(side="right", padx=4)
 
         # Treeview
@@ -1028,10 +1047,9 @@ class HistoryDialog(tk.Toplevel):
 
     def _on_select(self, event=None) -> None:
         record = self._get_selected_record()
-        if record:
-            self._confirm_btn.configure(state="normal")
-        else:
-            self._confirm_btn.configure(state="disabled")
+        state = "normal" if record else "disabled"
+        self._confirm_btn.configure(state=state)
+        self._add_to_playlist_btn.configure(state=state)
 
     def _on_double_click(self, event: tk.Event) -> None:
         record = self._get_selected_record()
@@ -1058,6 +1076,7 @@ class HistoryDialog(tk.Toplevel):
         menu.add_command(label="复制 URL", command=self._copy_selected_url)
         menu.add_command(label="修改备注", command=self._edit_remark_selected)
         menu.add_command(label="录制", command=self._record_selected_url)
+        menu.add_command(label="加入播放列表", command=self._add_to_playlist)
 
         players = self._parent._config.get("players", {})
         if players:
@@ -1065,15 +1084,11 @@ class HistoryDialog(tk.Toplevel):
             for name in players:
                 play_menu.add_command(
                     label=f"▶ {name}",
-                    command=lambda n=name, u=record["url"]: self._parent._open_in_player(n, u)
+                    command=lambda n=name, u=record["url"]: self._parent._play_single_url(n, u)
                 )
             menu.add_cascade(label="播放", menu=play_menu)
 
         menu.add_command(label="删除", command=self._delete_selected)
-
-        if self._parent._playlist_urls:
-            menu.add_separator()
-            menu.add_command(label="清空播放队列", command=self._parent._clear_queue)
 
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -1099,6 +1114,16 @@ class HistoryDialog(tk.Toplevel):
         self._records = [r for r in self._records if r["id"] != record_id]
         _save_history(self._records)
         self._load_records()
+
+    def _add_to_playlist(self) -> None:
+        record = self._get_selected_record()
+        if not record:
+            return
+        url = record["url"]
+        self._parent._playlist_urls.append(_build_playlist_item(url, record.get("remark", "")))
+        self._parent._write_playlist()
+        self._parent._update_player_button_states()
+        _show_toast(self, "已加入播放列表")
 
     def _edit_remark_selected(self) -> None:
         record = self._get_selected_record()
@@ -1164,6 +1189,259 @@ class HistoryDialog(tk.Toplevel):
             self._records = []
             _save_history([])
             self._load_records()
+
+
+# ── Playlist dialog ────────────────────────────────────────────
+
+
+class PlaylistDialog(tk.Toplevel):
+    """Dialog for viewing and managing the playback queue."""
+
+    def __init__(self, parent: tk.Tk):
+        super().__init__(parent)
+        self.title("播放列表")
+        self.resizable(True, True)
+        self.minsize(600, 400)
+        self.grab_set()
+
+        self._parent = parent
+
+        # ── Bottom button row (pack first so Treeview fills remaining space) ──
+        frm_btn = ttk.Frame(self, padding=8)
+        frm_btn.pack(fill="x", side="bottom")
+
+        self._auto_dedupe_var = tk.BooleanVar(value=self._parent._config.get("auto_dedupe", False))
+        ttk.Checkbutton(frm_btn, text="自动去重", variable=self._auto_dedupe_var,
+                        command=self._on_auto_dedupe_toggle).pack(side="left", padx=4)
+        ttk.Button(frm_btn, text="去重", command=self._on_dedupe_click, width=8).pack(side="left", padx=4)
+        ttk.Button(frm_btn, text="添加当前URL", command=self._on_add_current, width=10).pack(side="left", padx=4)
+        ttk.Button(frm_btn, text="清空", command=self._on_clear_click, width=8).pack(side="right", padx=4)
+        ttk.Button(frm_btn, text="关闭", command=self.destroy, width=8).pack(side="right", padx=4)
+
+        # ── Treeview ──
+        columns = ("idx", "time", "url", "duration", "resolution", "remark")
+        self._tree = ttk.Treeview(self, columns=columns, show="headings", selectmode="browse")
+
+        self._tree.heading("idx", text="#")
+        self._tree.heading("time", text="时间")
+        self._tree.heading("url", text="URL")
+        self._tree.heading("duration", text="时长")
+        self._tree.heading("resolution", text="分辨率")
+        self._tree.heading("remark", text="备注")
+
+        self._tree.column("idx", width=40, minwidth=30, stretch=False)
+        self._tree.column("time", width=110, minwidth=90, stretch=False)
+        self._tree.column("url", width=250, minwidth=150, stretch=True)
+        self._tree.column("duration", width=70, minwidth=60, stretch=False)
+        self._tree.column("resolution", width=70, minwidth=60, stretch=False)
+        self._tree.column("remark", width=100, minwidth=60, stretch=True)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self._tree.pack(fill="both", expand=True)
+
+        self._tree.bind("<Double-1>", self._on_double_click)
+        self._tree.bind("<Button-3>", self._on_right_click)
+        self._tree.tag_configure("even", background="#ffffff")
+        self._tree.tag_configure("odd", background="#f2f2f2")
+        TreeviewToolTip(self._tree)
+
+        self._load_list()
+        self._center_on_parent()
+
+    def destroy(self) -> None:
+        self._parent.focus_set()
+        super().destroy()
+
+    def _center_on_parent(self) -> None:
+        self.update_idletasks()
+        dialog_w, dialog_h = 700, 450
+        p = self._parent
+        x = p.winfo_x() + (p.winfo_width() - dialog_w) // 2
+        y = p.winfo_y() + (p.winfo_height() - dialog_h) // 2
+        self.geometry(f"{dialog_w}x{dialog_h}+{x}+{y}")
+        self.lift()
+        self.focus()
+
+    def _load_list(self) -> None:
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        items = self._parent._playlist_urls
+        for i, entry in enumerate(items):
+            tag = "even" if i % 2 == 0 else "odd"
+            self._tree.insert("", "end", values=(
+                i + 1,
+                entry.get("time", ""),
+                entry.get("url", ""),
+                entry.get("duration", ""),
+                entry.get("resolution", ""),
+                entry.get("remark", ""),
+            ), tags=(tag,))
+        self.title(f"播放列表 ({len(items)})")
+
+    def _get_selected_url(self) -> str | None:
+        selection = self._tree.selection()
+        if not selection:
+            return None
+        item = self._tree.item(selection[0])
+        return item["values"][2] if len(item["values"]) > 2 else None
+
+    def _get_selected_index(self) -> int | None:
+        selection = self._tree.selection()
+        if not selection:
+            return None
+        item = self._tree.item(selection[0])
+        idx = item["values"][0]
+        return int(idx) - 1 if idx else None
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        url = self._get_selected_url()
+        if not url:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        _show_toast(self, "URL 已复制到剪贴板")
+
+    def _on_right_click(self, event: tk.Event) -> None:
+        row = self._tree.identify_row(event.y)
+        if not row:
+            return
+        self._tree.selection_set(row)
+
+        url = self._get_selected_url()
+        if not url:
+            return
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="复制 URL", command=self._on_copy_url)
+        menu.add_command(label="修改备注", command=self._on_edit_remark)
+        menu.add_command(label="录制", command=self._on_record_url)
+
+        players = self._parent._config.get("players", {})
+        if players:
+            play_menu = tk.Menu(menu, tearoff=0)
+            for name in players:
+                play_menu.add_command(
+                    label=f"▶ {name}",
+                    command=lambda n=name: self._parent._play_single_url(n, url)
+                )
+            menu.add_cascade(label="播放", menu=play_menu)
+
+        menu.add_separator()
+        menu.add_command(label="删除", command=self._on_delete_selected)
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_copy_url(self) -> None:
+        url = self._get_selected_url()
+        if url:
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            _show_toast(self, "URL 已复制到剪贴板")
+
+    def _on_edit_remark(self) -> None:
+        idx = self._get_selected_index()
+        if idx is None or idx < 0 or idx >= len(self._parent._playlist_urls):
+            return
+        entry = self._parent._playlist_urls[idx]
+        dialog = tk.Toplevel(self)
+        dialog.title("修改备注")
+        dialog.resizable(False, False)
+        frm = ttk.Frame(dialog, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="备注:").pack(anchor="w")
+        var = tk.StringVar(value=entry.get("remark", ""))
+        entry_w = ttk.Entry(frm, textvariable=var, width=40)
+        entry_w.pack(fill="x", pady=(4, 12))
+        entry_w.focus_set()
+        entry_w.selection_range(0, "end")
+
+        btn_frm = ttk.Frame(frm)
+        btn_frm.pack(fill="x")
+
+        def on_save():
+            entry["remark"] = var.get().strip()
+            self._load_list()
+            dialog.destroy()
+
+        ttk.Button(btn_frm, text="取消", command=dialog.destroy, width=8).pack(side="right", padx=(4, 0))
+        ttk.Button(btn_frm, text="保存", command=on_save, width=8).pack(side="right")
+        entry_w.bind("<Return>", lambda e: on_save())
+
+        dialog.update_idletasks()
+        dw, dh = dialog.winfo_width(), dialog.winfo_height()
+        x = self.winfo_rootx() + (self.winfo_width() - dw) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dh) // 2
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+        dialog.wait_window()
+
+    def _on_record_url(self) -> None:
+        url = self._get_selected_url()
+        if not url:
+            return
+        self._parent._load_url_to_ui(url, record_history=False, from_history=True)
+        save_dir = self._parent._save_dir_var.get().strip()
+        dialog = RecordDialog(self._parent, url, save_dir)
+        result = dialog.show()
+        if result:
+            rec_url, output, duration = result
+            self._parent._start_recording(rec_url, output, duration)
+
+    def _on_delete_selected(self) -> None:
+        idx = self._get_selected_index()
+        if idx is None or idx < 0 or idx >= len(self._parent._playlist_urls):
+            return
+        self._parent._playlist_urls.pop(idx)
+        self._parent._write_playlist()
+        self._parent._update_player_button_states()
+        self._load_list()
+
+    def _on_dedupe_click(self) -> None:
+        items = self._parent._playlist_urls
+        seen = set()
+        deduped = []
+        for entry in items:
+            u = entry["url"]
+            if u not in seen:
+                seen.add(u)
+                deduped.append(entry)
+        removed = len(items) - len(deduped)
+        if removed == 0:
+            _show_toast(self, "无重复项")
+            return
+        self._parent._playlist_urls = deduped
+        self._parent._write_playlist()
+        self._parent._update_player_button_states()
+        self._load_list()
+        _show_toast(self, f"已移除 {removed} 个重复项")
+
+    def _on_add_current(self) -> None:
+        url = self._parent._url_var.get().strip()
+        if not url:
+            _show_toast(self, "无可用 URL")
+            return
+        if any(i["url"] == url for i in self._parent._playlist_urls):
+            _show_toast(self, "URL 已在播放列表中")
+            return
+        self._parent._playlist_urls.append(_build_playlist_item(url))
+        self._parent._write_playlist()
+        self._parent._update_player_button_states()
+        self._load_list()
+        _show_toast(self, "已添加当前 URL")
+
+    def _on_clear_click(self) -> None:
+        self._parent._clear_queue()
+        self._parent._playlist_urls.clear()
+        self._parent._playlist_path = None
+        self._parent._ipc_pipe = ""
+        self._parent._update_player_button_states()
+        self.destroy()
+
+    def _on_auto_dedupe_toggle(self) -> None:
+        self._parent._config["auto_dedupe"] = self._auto_dedupe_var.get()
+        _save_config(self._parent._config)
 
 
 # ── Record dialog ──────────────────────────────────────────────
@@ -2261,6 +2539,7 @@ class App(tk.Tk):
         debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
                                      textvariable=self._debounce_var, width=5)
         debounce_spin.pack(side="left")
+        ttk.Button(row_auto, text="播放列表", command=self._open_playlist_dialog, width=8).pack(side="left", padx=(8, 0))
         def _debounce_wheel(event):
             self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
             return "break"
@@ -2354,7 +2633,8 @@ class App(tk.Tk):
         self._log_text.pack(fill="both", expand=True)
         self._log_text.tag_configure("sel", background="#3399FF", foreground="white")
         self._log_text.tag_raise("sel")
-        self._log_text.bind("<Key>", lambda e: "break")
+        self._log_text.bind("<Key>", self._block_log_edit_keys)
+        self._add_log_copy_menu(self._log_text)
 
         self._history_log_frame = ttk.Frame(self._log_container)
         self._history_log_text = tk.Text(self._history_log_frame, height=8, wrap="word",
@@ -2364,7 +2644,8 @@ class App(tk.Tk):
         self._history_log_text.pack(fill="both", expand=True)
         self._history_log_text.tag_configure("sel", background="#3399FF", foreground="white")
         self._history_log_text.tag_raise("sel")
-        self._history_log_text.bind("<Key>", lambda e: "break")
+        self._history_log_text.bind("<Key>", self._block_log_edit_keys)
+        self._add_log_copy_menu(self._history_log_text)
 
         self._log_tab = "current"
         self._current_log_frame.pack(fill="both", expand=True)
@@ -2457,64 +2738,88 @@ class App(tk.Tk):
 
     def _open_in_player(self, player_name: str, url: str | None = None) -> None:
         """Open captured URL in a specific player by name."""
+        log.debug(">>> _open_in_player: player=%s url_in=%s", player_name, url[:60] if url else None)
         now = time.monotonic()
         debounce = self._config.get("manual_click_debounce", 2.0)
-        if now - self._last_manual_click_time < debounce:
+        elapsed = now - self._last_manual_click_time
+        log.debug("    debounce: elapsed=%.3fs threshold=%.3fs", elapsed, debounce)
+        if elapsed < debounce:
+            log.debug("    <<< debounce blocked")
             return
         self._last_manual_click_time = now
         url = url or self._url_var.get()
+        if not url and self._playlist_urls:
+            url = self._playlist_urls[0]["url"]
+        log.debug("    resolved url=%s playlist_len=%d", url[:60] if url else None, len(self._playlist_urls))
         if not url:
+            log.debug("    <<< no URL, returning")
             return
         players = self._config.get("players", {})
         entry = players.get(player_name)
         if not entry:
+            log.debug("    <<< player '%s' not configured", player_name)
             _show_warning(self, "提示", f"播放器 {player_name} 未配置")
             return
         path_or_cmd = _get_player_path(entry)
         player_path = _find_player_executable(path_or_cmd)
+        log.debug("    _find_player_executable(%s) → %s", path_or_cmd, player_path)
         if not player_path:
+            log.debug("    <<< player not found, showing warning")
             _show_warning(self, "提示", f"未找到 {player_name} ({path_or_cmd})，请检查路径或重新添加")
             return
-        if not self._launch_manual_player(player_name, url):
+        log.debug("    calling _launch_manual_player ...")
+        result = self._launch_manual_player(player_name, url)
+        log.debug("    _launch_manual_player returned %s", result)
+        if not result:
             _show_error(self, "错误", f"启动播放器 {player_name} 失败")
 
     def _launch_manual_player(self, player_name: str, url: str) -> bool:
+        log.debug(">>> _launch_manual_player: player=%s url=%s", player_name, url[:60] if url else None)
         players = self._config.get("players", {})
         entry = players.get(player_name)
         if not entry:
+            log.debug("    <<< entry not found")
             return False
         path_or_cmd = _get_player_path(entry)
         protocol = _get_player_manual_protocol(entry)
         player_path = _find_player_executable(path_or_cmd)
+        log.debug("    path_or_cmd=%s  protocol=%s  player_path=%s", path_or_cmd, protocol, player_path)
         if not player_path:
+            log.debug("    <<< player_path is None, returning False")
             return False
 
         stem = Path(player_path).stem.lower()
 
         if protocol == "auto":
             is_playlist = self._is_playlist_stem(stem)
-            log.info("协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
+            log.debug("    协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
         elif protocol in ("playlist", "ipc"):
             is_playlist = True
-            log.info("协议决策: %s → playlist", protocol)
+            log.debug("    协议决策: %s → playlist", protocol)
         else:
             is_playlist = False
-            log.info("协议决策: %s → direct", protocol)
+            log.debug("    协议决策: %s → direct", protocol)
 
-        self._playlist_urls.append(url)
+        is_duplicate = self._config.get("auto_dedupe", False) and any(i["url"] == url for i in self._playlist_urls)
+        if is_duplicate:
+            log.debug("    列表去重：URL 已存在，不重复添加")
+        else:
+            self._playlist_urls.append(_build_playlist_item(url))
+            self._update_player_button_states()
 
         # IPC 分支：复用已有 mpv 进程，追加不中断
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
-            log.debug("手动播放 IPC 追加: pipe=%s url=%s", self._ipc_pipe, url)
+            log.debug("    IPC 追加: pipe=%s url=%s", self._ipc_pipe, url[:60])
             self._write_playlist()
             if self._mpv_ipc_append(url, "append"):
-                log.info("手动播放(IPC append) %s: %s", player_name, url)
+                log.debug("    IPC append 成功")
                 return True
-            log.warning("IPC 追加失败，回退到新进程 (pipe=%s)", self._ipc_pipe)
+            log.debug("    IPC 追加失败，回退到新进程")
 
         # non-mpv 非 IPC 模式：manual_kill_prev 控制是否杀旧进程
         if not (is_playlist and "mpv" in stem):
             if self._manual_kill_prev_var.get():
+                log.debug("    终止旧手动播放器进程 (kill_prev=True)")
                 self._stop_player()
                 for proc in self._manual_player_procs:
                     if proc.poll() is None:
@@ -2526,73 +2831,118 @@ class App(tk.Tk):
 
         # mpv 非 IPC 模式：终止旧 mpv 进程再启动新的
         if is_playlist and "mpv" in stem and self._player_proc and self._player_proc.poll() is None:
+            log.debug("    终止旧 mpv 进程")
             self._stop_player()
 
         try:
             if is_playlist:
                 self._write_playlist()
-                log.debug("手动播放: .m3u %s 含 %d 个 URL", self._playlist_path, len(self._playlist_urls))
                 if "mpv" in stem:
                     if not self._ipc_pipe or not (self._player_proc and self._player_proc.poll() is None):
                         pipe_name = f"smc-mpv-{os.getpid()}"
                         self._ipc_pipe = pipe_name
                     cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{self._ipc_pipe}", "--idle=yes", "--keep-open=yes", str(self._playlist_path)]
+                    log.debug("    Popen(mpv playlist+IPC): %s", cmd)
                     self._player_proc = self._spawn_mpv(cmd, f"手动 {player_name}")
                 else:
                     cmd = [player_path, str(self._playlist_path)]
+                    log.debug("    Popen(playlist): %s", cmd)
                     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                     _log_stderr(proc, f"[手动 {player_name}] ")
                     self._manual_player_procs.append(proc)
             else:
                 cmd = [player_path, url]
+                log.debug("    Popen(direct): %s", cmd)
                 proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                 _log_stderr(proc, f"[手动 {player_name}] ")
                 self._manual_player_procs.append(proc)
 
+            log.debug("    <<< 成功, 返回 True")
             log.info("手动播放 %s: %s", player_name, url)
             return True
         except Exception as exc:
+            log.debug("    <<< 异常: %s", exc)
             log.error("手动播放失败: %s", exc)
             return False
 
-    def _launch_auto_player(self, player_name: str, url: str) -> bool:
+    def _play_single_url(self, player_name: str, url: str) -> bool:
+        """Play a single URL without adding to playlist or affecting the queue."""
+        log.debug(">>> _play_single_url: player=%s url=%s", player_name, url[:60] if url else None)
         players = self._config.get("players", {})
         entry = players.get(player_name)
         if not entry:
+            log.debug("    <<< entry not found")
+            return False
+
+        path_or_cmd = _get_player_path(entry)
+        player_path = _find_player_executable(path_or_cmd)
+        if not player_path:
+            log.debug("    <<< player not found")
+            _show_warning(self, "提示", f"未找到 {player_name} ({path_or_cmd})，请检查路径")
+            return False
+
+        log.debug("    player_path=%s", player_path)
+
+        try:
+            cmd = [player_path, url]
+            log.debug("    Popen: %s", cmd)
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+            _log_stderr(proc, f"[单次 {player_name}] ")
+            self._manual_player_procs.append(proc)
+            log.info("单次播放 %s: %s", player_name, url)
+            return True
+        except Exception as exc:
+            log.debug("    <<< 异常: %s", exc)
+            log.error("单次播放失败: %s", exc)
+            return False
+
+    def _launch_auto_player(self, player_name: str, url: str) -> bool:
+        log.debug(">>> _launch_auto_player: player=%s url=%s", player_name, url[:60] if url else None)
+        players = self._config.get("players", {})
+        entry = players.get(player_name)
+        if not entry:
+            log.debug("    <<< entry not found")
             return False
         path_or_cmd = _get_player_path(entry)
         protocol = _get_player_protocol(entry)
         player_path = _find_player_executable(path_or_cmd)
+        log.debug("    path_or_cmd=%s  protocol=%s  player_path=%s", path_or_cmd, protocol, player_path)
         if not player_path:
+            log.debug("    <<< player_path is None")
             return False
 
         stem = Path(player_path).stem.lower()
 
         if protocol == "auto":
             is_playlist = self._is_playlist_stem(stem)
-            log.info("协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
+            log.debug("    协议决策: auto → %s (stem=%s)", "playlist" if is_playlist else "direct", stem)
         elif protocol in ("playlist", "ipc"):
             is_playlist = True
-            log.info("协议决策: %s → playlist", protocol)
+            log.debug("    协议决策: %s → playlist", protocol)
         else:
             is_playlist = False
-            log.info("协议决策: %s → direct", protocol)
+            log.debug("    协议决策: %s → direct", protocol)
 
-        self._playlist_urls.append(url)
-        log.info("=== _launch_auto_player [%s] url=%s 队列长度=%d ===", player_name, url, len(self._playlist_urls))
+        if self._config.get("auto_dedupe", False) and any(i["url"] == url for i in self._playlist_urls):
+            log.debug("    <<< 自动去重跳过重复 URL: %s", url[:60])
+            return True
+
+        self._playlist_urls.append(_build_playlist_item(url))
+        self._update_player_button_states()
+        log.debug("    队列长度=%d", len(self._playlist_urls))
 
         # IPC 分支：复用已有 mpv 进程，追加不中断
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
-            log.info("IPC 追加尝试: pipe=%s gen=%d url=%s", self._ipc_pipe, getattr(self, "_mpv_generation", 0), url)
+            log.debug("    IPC 追加尝试: pipe=%s gen=%d url=%s", self._ipc_pipe, getattr(self, "_mpv_generation", 0), url[:60])
             self._write_playlist()
             if self._mpv_ipc_append(url, "append"):
-                log.info("自动播放(IPC append 成功) %s: %s 队列=%d", player_name, url, len(self._playlist_urls))
+                log.debug("    <<< IPC append 成功")
                 return True
-            log.warning("IPC 追加失败，将重启进程 (pipe=%s)", self._ipc_pipe)
+            log.debug("    IPC 追加失败，将重启进程")
 
         # 终止旧进程
         if self._player_proc and self._player_proc.poll() is None:
-            log.info("fallback: 终止旧 mpv (pid=%s) gen=%d", self._player_proc.pid, getattr(self, "_mpv_generation", 0))
+            log.debug("    终止旧 mpv (pid=%s)", self._player_proc.pid)
             self._stop_player()
 
         self._last_player_name = player_name
@@ -2600,24 +2950,28 @@ class App(tk.Tk):
         try:
             if is_playlist:
                 self._write_playlist()
-                log.info("fallback: 重新启动 mpv, 队列=%d 文件=%s", len(self._playlist_urls), self._playlist_path)
                 if "mpv" in stem:
                     pipe_name = f"smc-mpv-{os.getpid()}"
                     self._ipc_pipe = pipe_name
                     cmd = [player_path, fr"--input-ipc-server=\\.\pipe\{pipe_name}", "--idle=yes", "--keep-open=yes", str(self._playlist_path)]
+                    log.debug("    Popen(mpv playlist+IPC): %s", cmd)
                     self._player_proc = self._spawn_mpv(cmd, f"自动 {player_name}")
                 else:
                     cmd = [player_path, str(self._playlist_path)]
+                    log.debug("    Popen(playlist): %s", cmd)
                     self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                     _log_stderr(self._player_proc, f"[自动 {player_name}] ")
             else:
                 cmd = [player_path, url]
+                log.debug("    Popen(direct): %s", cmd)
                 self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                 _log_stderr(self._player_proc, f"[自动 {player_name}] ")
 
+            log.debug("    <<< 成功, 返回 True")
             log.info("自动播放 %s: %s", player_name, url)
             return True
         except Exception as exc:
+            log.debug("    <<< 异常: %s", exc)
             log.error("自动播放失败: %s", exc)
             return False
 
@@ -2629,8 +2983,8 @@ class App(tk.Tk):
         if self._playlist_path is None:
             self._playlist_path = Path(tempfile.gettempdir()) / f"smc_playlist_{os.getpid()}.m3u"
         lines = ["#EXTM3U\n"]
-        for url in self._playlist_urls:
-            lines.append(f"{url}\n")
+        for item in self._playlist_urls:
+            lines.append(f"{item['url']}\n")
         self._playlist_path.write_text("".join(lines), encoding="utf-8")
 
     def _mpv_ipc_append(self, url: str, mode: str = "append") -> bool:
@@ -2757,6 +3111,9 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _open_playlist_dialog(self) -> None:
+        PlaylistDialog(self)
+
     def _save_manual_kill_settings(self) -> None:
         self._config["manual_kill_prev"] = self._manual_kill_prev_var.get()
         _save_config(self._config)
@@ -2771,11 +3128,7 @@ class App(tk.Tk):
             self._layout_in_progress = False
 
     def _on_player_buttons_right_click(self, event: tk.Event) -> None:
-        if not self._playlist_urls:
-            return
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="清空播放队列", command=self._clear_queue)
-        menu.tk_popup(event.x_root, event.y_root)
+        pass
 
     def _do_layout_player_buttons(self) -> None:
         frame = self._player_buttons_frame
@@ -2843,7 +3196,7 @@ class App(tk.Tk):
         self._player_btn_list.clear()
 
         # Create real widgets inside row frames
-        state = "normal" if self._url_var.get() else "disabled"
+        state = "normal" if (self._url_var.get() or self._playlist_urls) else "disabled"
         for row_indices in rows:
             row_frame = ttk.Frame(frame)
             row_frame.pack(anchor="w", pady=1)
@@ -2872,6 +3225,15 @@ class App(tk.Tk):
         self._player_buttons.clear()
         self._player_btn_widths = None
         self._layout_player_buttons()
+
+    def _update_player_button_states(self) -> None:
+        """Refresh player button enabled/disabled based on URL and playlist."""
+        state = "normal" if (self._url_var.get() or self._playlist_urls) else "disabled"
+        for name, btn in self._player_buttons.items():
+            try:
+                btn.configure(state=state)
+            except tk.TclError:
+                pass
 
     def _on_players_changed(self) -> None:
         self._rebuild_player_buttons()
@@ -2958,6 +3320,7 @@ class App(tk.Tk):
     def _load_url_to_ui(self, url: str, record_history: bool = True, remark: str = "", from_history: bool = False) -> None:
         """Load a URL into the capture card UI."""
         self._url_var.set(url)
+        self._update_player_button_states()
         self._info_var.set("获取流信息中...")
         self._remark_var.set(remark)
         self._update_remark_mode()
@@ -3204,6 +3567,33 @@ class App(tk.Tk):
         if url:
             self.clipboard_clear()
             self.clipboard_append(url)
+
+    @staticmethod
+    def _add_log_copy_menu(text_widget: tk.Text) -> None:
+        """Add right-click context menu with Copy and Select All to a log text widget."""
+        menu = tk.Menu(text_widget, tearoff=0)
+        menu.add_command(label="复制", command=lambda: text_widget.event_generate("<<Copy>>"))
+        menu.add_separator()
+        menu.add_command(label="全选", command=lambda: text_widget.tag_add("sel", "1.0", "end"))
+        def _show_menu(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+        text_widget.bind("<Button-3>", _show_menu)
+
+    @staticmethod
+    def _block_log_edit_keys(event: tk.Event) -> str | None:
+        """Block editing keys but allow copy, select-all, navigation."""
+        if event.state & 0x4 and event.keysym.lower() == "c":
+            return None
+        if event.state & 0x4 and event.keysym.lower() == "a":
+            event.widget.tag_add("sel", "1.0", "end")
+            return "break"
+        if event.keysym in ("Up", "Down", "Left", "Right", "Home", "End",
+                           "Prior", "Next", "Tab", "Escape", "F5"):
+            return None
+        return "break"
 
     def _switch_log_tab(self) -> None:
         tab = self._log_tab_var.get()
