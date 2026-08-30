@@ -2252,7 +2252,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.5.1")
+        self.title("screen-mirroring-capture v1.6.0")
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -2846,12 +2846,16 @@ class App(tk.Tk):
                     self._player_proc = self._spawn_mpv(cmd, f"手动 {player_name}")
                 else:
                     cmd = [player_path, str(self._playlist_path)]
+                    if "ffplay" in stem:
+                        cmd.insert(1, "-nostats")
                     log.debug("    Popen(playlist): %s", cmd)
                     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                     _log_stderr(proc, f"[手动 {player_name}] ")
                     self._manual_player_procs.append(proc)
             else:
                 cmd = [player_path, url]
+                if "ffplay" in stem:
+                    cmd.insert(1, "-nostats")
                 log.debug("    Popen(direct): %s", cmd)
                 proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                 _log_stderr(proc, f"[手动 {player_name}] ")
@@ -2885,6 +2889,8 @@ class App(tk.Tk):
 
         try:
             cmd = [player_path, url]
+            if "ffplay" in Path(player_path).stem.lower():
+                cmd.insert(1, "-nostats")
             log.debug("    Popen: %s", cmd)
             proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
             _log_stderr(proc, f"[单次 {player_name}] ")
@@ -2958,11 +2964,15 @@ class App(tk.Tk):
                     self._player_proc = self._spawn_mpv(cmd, f"自动 {player_name}")
                 else:
                     cmd = [player_path, str(self._playlist_path)]
+                    if "ffplay" in stem:
+                        cmd.insert(1, "-nostats")
                     log.debug("    Popen(playlist): %s", cmd)
                     self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                     _log_stderr(self._player_proc, f"[自动 {player_name}] ")
             else:
                 cmd = [player_path, url]
+                if "ffplay" in stem:
+                    cmd.insert(1, "-nostats")
                 log.debug("    Popen(direct): %s", cmd)
                 self._player_proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                 _log_stderr(self._player_proc, f"[自动 {player_name}] ")
