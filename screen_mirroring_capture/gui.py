@@ -2940,13 +2940,15 @@ class App(tk.Tk):
         row_ctrl = FlowFrame(frm_capture)
         row_ctrl.pack(fill="x")
         # Order asked for: state | start/stop | continuous | history | playlist.
-        # The label gets a fixed width so the growing text ("持续捕获中 (12)")
-        # cannot push the buttons around while a capture is running.  17 chars
-        # covers the longest string ("● 已停止 (共 999 个)", 113 px).
+        # The label auto-sizes to its text: a fixed slot kept the buttons from
+        # shifting but left a visible hole between "● 已停止" and the button.
         self._status_var = tk.StringVar(value="● 已停止")
-        self._status_label = ttk.Label(row_ctrl, textvariable=self._status_var,
-                                       foreground="red", width=17, anchor="w")
-        row_ctrl.add(self._status_label, padx=(0, 8))
+        self._status_label = ttk.Label(row_ctrl, textvariable=self._status_var, foreground="red")
+        row_ctrl.add(self._status_label, padx=(0, 10))
+        # The label grows/shrinks with its text, which changes the x offsets of
+        # everything to its right.  The flow's own <Configure> only fires when
+        # the frame itself resizes, so repack on the label's own resize.
+        self._status_label.bind("<Configure>", lambda e: row_ctrl.relayout(force=True))
         self._run_btn = ttk.Button(row_ctrl, text=_RUN_BTN_TEXT["idle"],
                                    command=self._toggle_capture, width=10)
         row_ctrl.add(self._run_btn, padx=(0, 12))
@@ -4139,7 +4141,7 @@ class App(tk.Tk):
             self._continuous_cb.configure(state="normal")
             cnt = self._capture_count
             if cnt and self._continuous_var.get():
-                self._show_status(f"● 已停止 (共 {cnt} 个)", "red")
+                self._show_status(f"● 已停止 (共捕获 {cnt} 个)", "red")
             else:
                 self._show_status("● 已停止", "red")
 
