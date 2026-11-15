@@ -81,6 +81,19 @@ _FORMAT_OPTIONS = [
     (".flac", "FLAC"),
 ]
 
+MAX_HISTORY_RECORDS = 1000
+MAX_HISTORY_LOG_SIZE = 20 * 1024 * 1024  # 20 MB
+
+# history.json is read-modify-written from both the Tk main thread and from
+# ffprobe worker threads, so every mutation must hold this lock.
+_HISTORY_LOCK = threading.RLock()
+
+# Default port per protocol — single source of truth for the UI and validation.
+_DEFAULT_PORTS: dict[str, int] = {"dlna": 9090, "airplay": 9091, "cast": 8009}
+
+# Playlist metadata fields filled in by an asynchronous ffprobe pass.
+_META_FIELDS = ("duration", "resolution", "video_codec", "audio_codec", "bitrate", "fps")
+
 _PROTOCOL_HELP = (
     "各协议选项含义：\n\n"
     "▸ auto（自动模式）— 推荐\n"
@@ -117,6 +130,19 @@ def _get_player_manual_protocol(entry: str | dict) -> str:
     if isinstance(entry, dict):
         return entry.get("manual_protocol", "auto")
     return "auto"
+
+
+def _parse_port(raw: object) -> int | None:
+    """Parse a port entry.
+
+    Returns:
+        The port number, or ``None`` when *raw* is not an integer in 1-65535.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if 1 <= value <= 65535 else None
 
 
 def _log_stderr(proc: subprocess.Popen, prefix: str = "") -> None:
@@ -313,34 +339,41 @@ def _save_history(records: list) -> None:
 
 def _add_history_record(url: str, info: dict, remark: str = "") -> None:
     """Add a capture record to history."""
-    records = _load_history()
-    record = {
-        "id": len(records) + 1,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "url": url,
-        "duration": info.get("duration", "未知"),
-        "video_codec": info.get("video_codec", ""),
-        "resolution": info.get("resolution", ""),
-        "fps": info.get("fps", ""),
-        "audio_codec": info.get("audio_codec", ""),
-        "bitrate": info.get("bitrate", ""),
-        "recorded": False,
-        "output": None,
-        "remark": remark,
-    }
-    records.append(record)
-    _save_history(records)
+    with _HISTORY_LOCK:
+        records = _load_history()
+        # Derive the id from the highest existing id: using len(records) + 1
+        # would collide with a surviving record after any deletion.
+        next_id = max((r.get("id", 0) for r in records), default=0) + 1
+        record = {
+            "id": next_id,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "url": url,
+            "duration": info.get("duration", "未知"),
+            "video_codec": info.get("video_codec", ""),
+            "resolution": info.get("resolution", ""),
+            "fps": info.get("fps", ""),
+            "audio_codec": info.get("audio_codec", ""),
+            "bitrate": info.get("bitrate", ""),
+            "recorded": False,
+            "output": None,
+            "remark": remark,
+        }
+        records.append(record)
+        if len(records) > MAX_HISTORY_RECORDS:
+            records = records[-MAX_HISTORY_RECORDS:]
+        _save_history(records)
 
 
 def _mark_history_record(url: str, output_path: str) -> None:
     """Mark the most recent matching history record as recorded."""
-    records = _load_history()
-    for record in reversed(records):
-        if record["url"] == url and not record.get("recorded"):
-            record["recorded"] = True
-            record["output"] = output_path
-            break
-    _save_history(records)
+    with _HISTORY_LOCK:
+        records = _load_history()
+        for record in reversed(records):
+            if record["url"] == url and not record.get("recorded"):
+                record["recorded"] = True
+                record["output"] = output_path
+                break
+        _save_history(records)
 
 
 def _load_recent_logs(max_lines: int = 200) -> list[str]:
@@ -365,6 +398,10 @@ def _merge_session_to_history(session_file: Path) -> None:
             hf.write(session_file.read_text(encoding="utf-8"))
             hf.write("\n")
         session_file.unlink()
+        if history_file.exists() and history_file.stat().st_size > MAX_HISTORY_LOG_SIZE:
+            lines = history_file.read_text(encoding="utf-8").splitlines()
+            mid = len(lines) // 2
+            history_file.write_text("\n".join(lines[mid:]) + "\n", encoding="utf-8")
     except Exception:
         log.debug("Failed to merge session to history", exc_info=True)
 
@@ -387,6 +424,31 @@ def _clear_log_files(mode: str = "history", current_file: Path = None) -> None:
                 history_file.unlink()
     except Exception:
         log.debug("Failed to clear log files", exc_info=True)
+
+
+def _cleanup_stale_files(days: int = 3) -> None:
+    """Remove orphaned session logs and faulthandler dumps older than *days*."""
+    try:
+        cutoff = datetime.now().timestamp() - days * 86400
+        for f in LOG_DIR.iterdir():
+            if not f.is_file():
+                continue
+            name = f.name
+            try:
+                if name.startswith("session_") and name.endswith(".log"):
+                    ts_str = name[len("session_"):-len(".log")]
+                    ts = datetime.strptime(ts_str, "%Y-%m-%d_%H-%M-%S").timestamp()
+                elif name.startswith("faulthandler-") and name.endswith(".txt"):
+                    ts_str = name[len("faulthandler-"):-len(".txt")]
+                    ts = datetime.strptime(ts_str, "%Y%m%d-%H%M%S").timestamp()
+                else:
+                    continue
+                if ts < cutoff:
+                    f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        log.debug("Failed to cleanup stale files", exc_info=True)
 
 
 def _detect_format(url: str) -> tuple[str, str]:
@@ -518,14 +580,17 @@ def _parse_stream_info(data: dict) -> dict:
     return info
 
 
-def _build_playlist_item(url: str, remark: str = "") -> dict:
-    """Build a playlist item dict with stream metadata."""
-    data = _get_stream_info(url)
-    info = _parse_stream_info(data) if data and "error" not in data else {}
+def _make_playlist_item(url: str, info: dict | None = None, remark: str = "") -> dict:
+    """Build a playlist item from already-known metadata.
+
+    This performs *no* I/O: it must stay cheap because it is called from Tk
+    callbacks.  Missing metadata is filled in later by an async ffprobe pass.
+    """
+    info = info or {}
     return {
         "url": url,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "duration": info.get("duration", "未知"),
+        "duration": info.get("duration", ""),
         "resolution": info.get("resolution", ""),
         "video_codec": info.get("video_codec", ""),
         "audio_codec": info.get("audio_codec", ""),
@@ -1111,18 +1176,18 @@ class HistoryDialog(tk.Toplevel):
             return
         item = self._tree.item(selection[0])
         record_id = int(item["tags"][0])
-        self._records = [r for r in self._records if r["id"] != record_id]
-        _save_history(self._records)
+        with _HISTORY_LOCK:
+            # Re-read from disk so entries added in the meantime are not lost.
+            records = [r for r in _load_history() if r["id"] != record_id]
+            _save_history(records)
+            self._records = records
         self._load_records()
 
     def _add_to_playlist(self) -> None:
         record = self._get_selected_record()
         if not record:
             return
-        url = record["url"]
-        self._parent._playlist_urls.append(_build_playlist_item(url, record.get("remark", "")))
-        self._parent._write_playlist()
-        self._parent._update_player_button_states()
+        self._parent._append_to_playlist(record["url"], record.get("remark", ""))
         _show_toast(self, "已加入播放列表")
 
     def _edit_remark_selected(self) -> None:
@@ -1147,8 +1212,15 @@ class HistoryDialog(tk.Toplevel):
         result = [False]
 
         def on_save() -> None:
-            record["remark"] = var.get().strip()
-            _save_history(self._records)
+            remark_text = var.get().strip()
+            with _HISTORY_LOCK:
+                records = _load_history()
+                for rec in records:
+                    if rec["id"] == record["id"]:
+                        rec["remark"] = remark_text
+                        break
+                _save_history(records)
+                self._records = records
             self._load_records()
             result[0] = True
             dialog.destroy()
@@ -1186,8 +1258,9 @@ class HistoryDialog(tk.Toplevel):
 
     def _clear_history(self) -> None:
         if _ask_yes_no(self, "确认", "确定要清空所有捕获历史记录吗？"):
-            self._records = []
-            _save_history([])
+            with _HISTORY_LOCK:
+                _save_history([])
+                self._records = []
             self._load_records()
 
 
@@ -1425,9 +1498,7 @@ class PlaylistDialog(tk.Toplevel):
         if any(i["url"] == url for i in self._parent._playlist_urls):
             _show_toast(self, "URL 已在播放列表中")
             return
-        self._parent._playlist_urls.append(_build_playlist_item(url))
-        self._parent._write_playlist()
-        self._parent._update_player_button_states()
+        self._parent._append_to_playlist(url)
         self._load_list()
         _show_toast(self, "已添加当前 URL")
 
@@ -2286,12 +2357,16 @@ class App(tk.Tk):
         self._continuous_var = tk.BooleanVar(value=False)
         self._capture_count = 0
         self._playlist_path: Path | None = None
-        self._playlist_urls: list[str] = []
+        self._playlist_urls: list[dict] = []
+        # url -> parsed stream info; filled by ffprobe outside the UI thread.
+        self._stream_info_cache: dict[str, dict] = {}
+        self._probe_pending: set[str] = set()
         self._last_player_name: str = ""
         self._ipc_pipe: str = ""
         self._last_manual_click_time: float = 0.0
         self._manual_player_procs: list[subprocess.Popen] = []
         self._manual_kill_prev_var = tk.BooleanVar(value=self._config.get("manual_kill_prev", False))
+        self._force_direct_var = tk.BooleanVar(value=self._config.get("force_direct", False))
         self._log_tab: str = "current"
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
         self._auto_play_last_url: str = ""
@@ -2440,12 +2515,12 @@ class App(tk.Tk):
         self._port_vars: dict[str, tk.StringVar] = {}
         self._proto_checkbuttons: dict[str, ttk.Checkbutton] = {}
         self._port_entries: dict[str, ttk.Entry] = {}
-        proto_defaults = {"dlna": 9090, "airplay": 9091, "cast": 8009}
         saved_protos = self._config.get("protocols", {})
         for proto in PROTOCOLS:
             proto_cfg = saved_protos.get(proto, {})
             enabled = proto_cfg.get("enabled", True)
-            port = proto_cfg.get("port", proto_defaults[proto])
+            # Older configs may hold 0 or garbage; fall back to the default.
+            port = _parse_port(proto_cfg.get("port", _DEFAULT_PORTS[proto])) or _DEFAULT_PORTS[proto]
             var = tk.BooleanVar(value=enabled)
             self._proto_vars[proto] = var
             cb = ttk.Checkbutton(row_proto, text=proto.upper(), variable=var, command=self._save_device_settings)
@@ -2534,6 +2609,8 @@ class App(tk.Tk):
         self._auto_play_combo.bind("<<ComboboxSelected>>", lambda e: self.after(10, self.focus_set))
         ttk.Checkbutton(row_auto, text="杀旧进程", variable=self._manual_kill_prev_var,
                         command=self._save_manual_kill_settings).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(row_auto, text="全局直连", variable=self._force_direct_var,
+                        command=self._save_force_direct_settings).pack(side="left", padx=(12, 0))
         ttk.Label(row_auto, text="防抖(秒):").pack(side="left", padx=(12, 2))
         self._debounce_var = tk.DoubleVar(value=self._config.get("manual_click_debounce", 2.0))
         debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
@@ -2566,8 +2643,9 @@ class App(tk.Tk):
 
         row_audio = ttk.Frame(frm_rec)
         row_audio.pack(fill="x", pady=(6, 0))
-        self._audio_rec_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row_audio, text="录制 AirPlay 音频", variable=self._audio_rec_var).pack(side="left")
+        self._audio_rec_var = tk.BooleanVar(value=bool(self._config.get("audio_record", False)))
+        ttk.Checkbutton(row_audio, text="录制 AirPlay 音频", variable=self._audio_rec_var,
+                        command=self._save_audio_output).pack(side="left")
         self._audio_output_var = tk.StringVar(value=self._config.get("audio_output", ""))
         self._audio_output_entry = ttk.Entry(row_audio, textvariable=self._audio_output_var, width=30)
         self._audio_output_entry.pack(side="left", padx=(8, 0), fill="x", expand=True)
@@ -2668,6 +2746,7 @@ class App(tk.Tk):
 
     def _save_audio_output(self) -> None:
         self._config["audio_output"] = self._audio_output_var.get().strip()
+        self._config["audio_record"] = self._audio_rec_var.get()
         _save_config(self._config)
 
     def _restore_defaults(self) -> None:
@@ -2675,8 +2754,7 @@ class App(tk.Tk):
         self._bind_ip_var.set("自动检测")
         for proto in PROTOCOLS:
             self._proto_vars[proto].set(True)
-            defaults = {"dlna": 9090, "airplay": 9091, "cast": 8009}
-            self._port_vars[proto].set(str(defaults[proto]))
+            self._port_vars[proto].set(str(_DEFAULT_PORTS[proto]))
         self._save_device_settings()
 
     def _save_device_settings(self) -> None:
@@ -2685,9 +2763,16 @@ class App(tk.Tk):
         self._config["bind_ip"] = self._adapter_map.get(selected_label, "")
         saved_protos = {}
         for proto in PROTOCOLS:
+            default = _DEFAULT_PORTS[proto]
+            port = _parse_port(self._port_vars[proto].get())
+            if port is None:
+                # Keep the stored value honest and show the user the real value
+                # instead of letting an unparseable entry reach capture().
+                port = default
+                self._port_vars[proto].set(str(default))
             saved_protos[proto] = {
                 "enabled": self._proto_vars[proto].get(),
-                "port": int(self._port_vars[proto].get().strip() or "0"),
+                "port": port,
             }
         self._config["protocols"] = saved_protos
         _save_config(self._config)
@@ -2712,12 +2797,59 @@ class App(tk.Tk):
         HistoryDialog(self)
 
     def _start(self) -> None:
+        # ── Validate everything up front ──────────────────────────────
+        # Nothing here may touch the running state: an invalid entry must
+        # leave the UI exactly as it was, not half-started.
+        protos = [p for p in PROTOCOLS if self._proto_vars[p].get()]
+        if not protos:
+            _show_warning(self, "提示", "请至少启用一个协议（DLNA / AirPlay / Cast）")
+            return
+
+        ports: dict[str, int] = {}
+        for proto in PROTOCOLS:
+            port = _parse_port(self._port_vars[proto].get())
+            if port is None:
+                _show_warning(
+                    self, "提示",
+                    f"{proto.upper()} 端口无效，请填写 1-65535 之间的整数",
+                )
+                self._port_entries[proto].focus_set()
+                return
+            ports[proto] = port
+
+        used: dict[int, str] = {}
+        for proto in protos:
+            other = used.get(ports[proto])
+            if other is not None:
+                _show_warning(
+                    self, "提示",
+                    f"{other.upper()} 与 {proto.upper()} 端口冲突（都是 {ports[proto]}），请修改",
+                )
+                return
+            used[ports[proto]] = proto
+
+        audio_output = None
+        if self._audio_rec_var.get():
+            if "airplay" not in protos:
+                _show_warning(self, "提示", "录制 AirPlay 音频需要启用 AirPlay 协议")
+                return
+            folder = self._audio_output_var.get().strip()
+            if not folder:
+                _show_warning(self, "提示", "请选择 AirPlay 音频保存目录")
+                return
+            try:
+                Path(folder).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                _show_warning(self, "提示", f"无法创建音频保存目录：{exc}")
+                return
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            audio_output = str(Path(folder) / f"airplay_audio_{stamp}.aac")
+
+        # ── Commit ────────────────────────────────────────────────────
         self._save_device_settings()
         self._stop_event.clear()
         self._capture_count = 0
         self._set_running(True)
-        protos = [p for p in PROTOCOLS if self._proto_vars[p].get()]
-        ports = {p: int(self._port_vars[p].get().strip()) for p in PROTOCOLS}
         bind_ip = self._adapter_map.get(self._bind_ip_var.get(), "")
         if not bind_ip:
             resolved_ip = get_lan_ip()
@@ -2728,7 +2860,7 @@ class App(tk.Tk):
                     break
         threading.Thread(
             target=self._capture_thread_fn,
-            args=(self._config["device_name"], ports, protos, bind_ip),
+            args=(self._config["device_name"], ports, protos, bind_ip, audio_output),
             daemon=True,
         ).start()
 
@@ -2782,6 +2914,8 @@ class App(tk.Tk):
             return False
         path_or_cmd = _get_player_path(entry)
         protocol = _get_player_manual_protocol(entry)
+        if self._force_direct_var.get():
+            protocol = "direct"
         player_path = _find_player_executable(path_or_cmd)
         log.debug("    path_or_cmd=%s  protocol=%s  player_path=%s", path_or_cmd, protocol, player_path)
         if not player_path:
@@ -2804,8 +2938,7 @@ class App(tk.Tk):
         if is_duplicate:
             log.debug("    列表去重：URL 已存在，不重复添加")
         else:
-            self._playlist_urls.append(_build_playlist_item(url))
-            self._update_player_button_states()
+            self._append_to_playlist(url)
 
         # IPC 分支：复用已有 mpv 进程，追加不中断
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
@@ -2911,6 +3044,8 @@ class App(tk.Tk):
             return False
         path_or_cmd = _get_player_path(entry)
         protocol = _get_player_protocol(entry)
+        if self._force_direct_var.get():
+            protocol = "direct"
         player_path = _find_player_executable(path_or_cmd)
         log.debug("    path_or_cmd=%s  protocol=%s  player_path=%s", path_or_cmd, protocol, player_path)
         if not player_path:
@@ -2933,8 +3068,7 @@ class App(tk.Tk):
             log.debug("    <<< 自动去重跳过重复 URL: %s", url[:60])
             return True
 
-        self._playlist_urls.append(_build_playlist_item(url))
-        self._update_player_button_states()
+        self._append_to_playlist(url)
         log.debug("    队列长度=%d", len(self._playlist_urls))
 
         # IPC 分支：复用已有 mpv 进程，追加不中断
@@ -2988,6 +3122,55 @@ class App(tk.Tk):
     @staticmethod
     def _is_playlist_stem(stem: str) -> bool:
         return any(x in stem for x in ("vlc", "mpc-hc", "mpc-be", "mpv"))
+
+    def _append_to_playlist(self, url: str, remark: str = "") -> None:
+        """Append *url* to the queue without blocking the UI thread.
+
+        Metadata already known for the URL is reused immediately; anything
+        missing is probed in the background and patched in afterwards.
+        """
+        self._playlist_urls.append(
+            _make_playlist_item(url, self._stream_info_cache.get(url), remark)
+        )
+        self._write_playlist()
+        self._update_player_button_states()
+        if url not in self._stream_info_cache:
+            self._probe_async(url)
+
+    def _probe_async(self, url: str) -> None:
+        """Probe *url* on a worker thread; never blocks Tk."""
+        if not url or url in self._stream_info_cache or url in self._probe_pending:
+            return
+        self._probe_pending.add(url)
+        threading.Thread(
+            target=self._probe_worker, args=(url,), daemon=True
+        ).start()
+
+    def _probe_worker(self, url: str) -> None:
+        try:
+            data = _get_stream_info(url)
+            info = _parse_stream_info(data) if data and not data.get("error") else {}
+        except Exception:
+            log.debug("probe worker failed for %s", url, exc_info=True)
+            info = {}
+        self._call_ui(self._apply_probe_result, url, info)
+
+    def _apply_probe_result(self, url: str, info: dict) -> None:
+        """Cache probe output and back-fill queue entries waiting for it."""
+        self._probe_pending.discard(url)
+        self._stream_info_cache[url] = info
+        changed = False
+        for item in self._playlist_urls:
+            if item["url"] != url:
+                continue
+            if any(item.get(k) for k in _META_FIELDS):
+                continue
+            for key in _META_FIELDS:
+                if info.get(key):
+                    item[key] = info[key]
+            changed = True
+        if changed:
+            self._write_playlist()
 
     def _write_playlist(self) -> None:
         if self._playlist_path is None:
@@ -3126,6 +3309,10 @@ class App(tk.Tk):
 
     def _save_manual_kill_settings(self) -> None:
         self._config["manual_kill_prev"] = self._manual_kill_prev_var.get()
+        _save_config(self._config)
+
+    def _save_force_direct_settings(self) -> None:
+        self._config["force_direct"] = self._force_direct_var.get()
         _save_config(self._config)
 
     def _layout_player_buttons(self) -> None:
@@ -3345,9 +3532,16 @@ class App(tk.Tk):
         self._rec_btn.configure(state="normal")
         for btn in self._player_buttons.values():
             btn.configure(state="normal")
-        threading.Thread(target=self._fetch_stream_info, args=(url, record_history), daemon=True).start()
+        # Snapshot the remark on the Tk thread: _fetch_stream_info runs on a
+        # worker thread and must not touch tkinter variables.
+        threading.Thread(
+            target=self._fetch_stream_info,
+            args=(url, record_history, self._remark_var.get()),
+            daemon=True,
+        ).start()
 
-    def _fetch_stream_info(self, url: str, record_history: bool = True) -> None:
+    def _fetch_stream_info(self, url: str, record_history: bool = True, remark: str = "") -> None:
+        """Probe *url* for stream metadata (worker thread — no Tk access)."""
         data = _get_stream_info(url)
         if data.get("error"):
             log.warning("流信息解析不可用: %s", data["error"])
@@ -3355,7 +3549,7 @@ class App(tk.Tk):
             self._call_ui(self._info_var.set,
                           "流信息: 解析失败（未找到 ffprobe，可在 config.json 配置 ffmpeg_dir，或安装 ffmpeg 到 PATH）")
             if record_history:
-                _add_history_record(url, {}, remark=self._remark_var.get())
+                _add_history_record(url, {}, remark=remark)
             return
         info = _parse_stream_info(data)
         duration_str = info.get("duration", "未知")
@@ -3377,10 +3571,12 @@ class App(tk.Tk):
         line1, line2 = _format_stream_info(info)
         combined = f"{line1}  {line2}" if line2 else line1
         self._call_ui(self._info_var.set, combined)
+        # Cache the result so playlist entries and later probes reuse it.
+        self._call_ui(self._apply_probe_result, url, info)
 
         # Save to history
         if record_history:
-            _add_history_record(url, info, remark=self._remark_var.get())
+            _add_history_record(url, info, remark=remark)
 
     def _update_remark_mode(self) -> None:
         for child in self._remark_frame.winfo_children():
@@ -3688,6 +3884,7 @@ def run() -> None:
     """Entry point for the GUI."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _cleanup_stale_files()
         _ft_path = LOG_DIR / f"faulthandler-{time.strftime('%Y%m%d-%H%M%S')}.txt"
         _ft = _ft_path.open("a")
         faulthandler.dump_traceback_later(45, exit=False, file=_ft)

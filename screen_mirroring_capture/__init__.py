@@ -38,6 +38,10 @@ __all__ = ["capture"]
 
 PROTOCOLS = ("dlna", "airplay", "cast")
 
+# In continuous mode only the last URL is returned, so cap the buffer to keep
+# a long-running capture from growing without bound.
+_MAX_COLLECTED = 200
+
 
 def capture(
     *,
@@ -65,7 +69,7 @@ def capture(
         on_play: Optional callback fired when a Play command is received.
         protocols: List of protocols to enable. Defaults to all:
                    ``["dlna", "airplay", "cast"]``.
-        audio_output: Directory to save AirPlay audio capture.
+        audio_output: Path of the ``.aac`` file to write AirPlay audio to.
         audio_duration: Max audio capture duration in seconds.
         stop_event: Optional threading.Event. When set, the function
                     stops waiting and returns ``None``.
@@ -92,8 +96,9 @@ def capture(
     def _handle(url: str) -> None:
         if not continuous and result:
             return
-        if not continuous:
-            result.append(url)
+        result.append(url)
+        if len(result) > _MAX_COLLECTED:
+            del result[:-_MAX_COLLECTED]
         if on_url:
             on_url(url)
         event.set()
@@ -109,6 +114,10 @@ def capture(
             UPnPHandler.on_url = staticmethod(_handle)
             UPnPHandler.on_play = staticmethod(on_play)
             UPnPHandler._captured = False
+            # Subscribers are class-level state; drop leftovers from a previous
+            # run so we never NOTIFY a callback URL that is no longer valid.
+            with UPnPHandler._subscribers_lock:
+                UPnPHandler._subscribers.clear()
 
             server = HTTPServer(("", port), UPnPHandler)
             ssdp = SSDPAdvertiser(dev_uuid, location, local_ip)
@@ -189,4 +198,4 @@ def capture(
 
     if not result:
         return None
-    return result[0] if not continuous else (result[-1] if result else None)
+    return result[-1] if continuous else result[0]
