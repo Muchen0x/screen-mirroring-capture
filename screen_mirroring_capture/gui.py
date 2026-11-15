@@ -688,6 +688,26 @@ class PersistentTextHandler(logging.Handler):
     def reset_counter(self) -> None:
         self._log_counter = 0
 
+    def rotate(self) -> Path:
+        """Switch to a fresh session log file and return its path.
+
+        Called after the current log is cleared: the handler re-opens the file
+        on every write, so without rotating the next record would immediately
+        re-create the file that was just deleted.
+        """
+        self._log_counter = 0
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        current = self.log_file
+        candidate = LOG_DIR / f"session_{stamp}.log"
+        index = 1
+        # Must differ from the file just deleted even when cleared within the
+        # same second.
+        while candidate.exists() or candidate == current:
+            candidate = LOG_DIR / f"session_{stamp}_{index}.log"
+            index += 1
+        self.log_file = candidate
+        return candidate
+
     def _append_file(self, msg: str) -> None:
         try:
             with open(self.log_file, "a", encoding="utf-8") as f:
@@ -866,9 +886,26 @@ class ScrollableFrame(ttk.Frame):
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
-        self._canvas.bind_all("<Button-4>", self._on_mousewheel, add="+")
-        self._canvas.bind_all("<Button-5>", self._on_mousewheel, add="+")
+        # Bind wheel events on the owning toplevel rather than bind_all: the
+        # toplevel-level binding dies together with the window, while bind_all
+        # left three global bindings behind for every dialog ever opened.
+        self._toplevel = self.winfo_toplevel()
+        self._wheel_bindings: list[tuple[str, str]] = []
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            funcid = self._toplevel.bind(seq, self._on_mousewheel, add="+")
+            if funcid:
+                self._wheel_bindings.append((seq, funcid))
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        for seq, funcid in self._wheel_bindings:
+            try:
+                self._toplevel.unbind(seq, funcid)
+            except tk.TclError:
+                pass
+        self._wheel_bindings.clear()
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         try:
@@ -2229,11 +2266,18 @@ class ToolTip:
 
 
 class TreeviewToolTip:
-    """Hover tooltip showing the full text of the treeview cell under cursor."""
+    """Hover tooltip showing the full text of the treeview cell under cursor.
+
+    The popup window is created once and then only shown/hidden, because
+    destroying and re-creating a Toplevel on every <Motion> event made the
+    table drop frames while the pointer moved across it.
+    """
 
     def __init__(self, treeview: ttk.Treeview) -> None:
         self._tv = treeview
         self._tw: tk.Toplevel | None = None
+        self._lbl: tk.Message | None = None
+        self._text = ""
         treeview.bind("<Motion>", self._on_motion, add="+")
         treeview.bind("<Leave>", self._on_leave, add="+")
 
@@ -2245,7 +2289,11 @@ class TreeviewToolTip:
             self.hide()
             return
         values = self._tv.item(row, "values")
-        col_idx = int(col[1:]) - 1
+        try:
+            col_idx = int(col[1:]) - 1
+        except ValueError:
+            self.hide()
+            return
         if 0 <= col_idx < len(values) and values[col_idx]:
             self._show(event, str(values[col_idx]))
         else:
@@ -2254,23 +2302,51 @@ class TreeviewToolTip:
     def _on_leave(self, event: tk.Event) -> None:
         self.hide()
 
+    def _ensure_window(self) -> bool:
+        """Create the popup lazily; returns True if it is usable."""
+        if self._tw is not None:
+            try:
+                if self._tw.winfo_exists():
+                    return True
+            except tk.TclError:
+                pass
+            self._tw = None
+            self._lbl = None
+        try:
+            self._tw = tk.Toplevel(self._tv)
+            self._tw.wm_overrideredirect(True)
+            self._lbl = tk.Message(
+                self._tw, text="", bg="#ffffff", fg="#333",
+                font=("Microsoft YaHei", 9), padx=6, pady=2,
+                relief="solid", borderwidth=1, width=400,
+                aspect=800,
+            )
+            self._lbl.pack()
+            self._tw.withdraw()
+            self._text = ""
+            return True
+        except tk.TclError:
+            self._tw = None
+            self._lbl = None
+            return False
+
     def _show(self, event: tk.Event, text: str) -> None:
-        self.hide()
-        self._tw = tk.Toplevel(self._tv)
-        self._tw.wm_overrideredirect(True)
+        if not self._ensure_window():
+            return
+        if text != self._text:
+            self._lbl.configure(text=text)
+            self._text = text
         self._tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
-        lbl = tk.Message(
-            self._tw, text=text, bg="#ffffff", fg="#333",
-            font=("Microsoft YaHei", 9), padx=6, pady=2,
-            relief="solid", borderwidth=1, width=400,
-            aspect=800,
-        )
-        lbl.pack()
+        self._tw.deiconify()
 
     def hide(self) -> None:
-        if self._tw:
-            self._tw.destroy()
+        if self._tw is None:
+            return
+        try:
+            self._tw.withdraw()
+        except tk.TclError:
             self._tw = None
+            self._lbl = None
 
 
 class ListboxToolTip:
@@ -2345,6 +2421,7 @@ class App(tk.Tk):
 
         self._running = False
         self._recording = False
+        self._closing = False
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._record_proc: subprocess.Popen | None = None
@@ -2407,8 +2484,13 @@ class App(tk.Tk):
         _recursive(self)
 
     def _on_close(self) -> None:
+        self._closing = True
         try:
             faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        try:
+            self._prune_player_procs()
         except Exception:
             pass
         if self._current_log_file:
@@ -2944,7 +3026,7 @@ class App(tk.Tk):
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
             log.debug("    IPC 追加: pipe=%s url=%s", self._ipc_pipe, url[:60])
             self._write_playlist()
-            if self._mpv_ipc_append(url, "append"):
+            if self._mpv_ipc_append(url, "append-play"):
                 log.debug("    IPC append 成功")
                 return True
             log.debug("    IPC 追加失败，回退到新进程")
@@ -2984,7 +3066,7 @@ class App(tk.Tk):
                     log.debug("    Popen(playlist): %s", cmd)
                     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                     _log_stderr(proc, f"[手动 {player_name}] ")
-                    self._manual_player_procs.append(proc)
+                    self._track_player_proc(proc)
             else:
                 cmd = [player_path, url]
                 if "ffplay" in stem:
@@ -2992,7 +3074,7 @@ class App(tk.Tk):
                 log.debug("    Popen(direct): %s", cmd)
                 proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
                 _log_stderr(proc, f"[手动 {player_name}] ")
-                self._manual_player_procs.append(proc)
+                self._track_player_proc(proc)
 
             log.debug("    <<< 成功, 返回 True")
             log.info("手动播放 %s: %s", player_name, url)
@@ -3027,7 +3109,7 @@ class App(tk.Tk):
             log.debug("    Popen: %s", cmd)
             proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
             _log_stderr(proc, f"[单次 {player_name}] ")
-            self._manual_player_procs.append(proc)
+            self._track_player_proc(proc)
             log.info("单次播放 %s: %s", player_name, url)
             return True
         except Exception as exc:
@@ -3075,7 +3157,7 @@ class App(tk.Tk):
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
             log.debug("    IPC 追加尝试: pipe=%s gen=%d url=%s", self._ipc_pipe, getattr(self, "_mpv_generation", 0), url[:60])
             self._write_playlist()
-            if self._mpv_ipc_append(url, "append"):
+            if self._mpv_ipc_append(url, "append-play"):
                 log.debug("    <<< IPC append 成功")
                 return True
             log.debug("    IPC 追加失败，将重启进程")
@@ -3180,7 +3262,7 @@ class App(tk.Tk):
             lines.append(f"{item['url']}\n")
         self._playlist_path.write_text("".join(lines), encoding="utf-8")
 
-    def _mpv_ipc_append(self, url: str, mode: str = "append") -> bool:
+    def _mpv_ipc_append(self, url: str, mode: str = "append-play") -> bool:
         if not self._ipc_pipe:
             log.debug("IPC append 失败: _ipc_pipe 为空")
             return False
@@ -3219,6 +3301,29 @@ class App(tk.Tk):
         except Exception as e:
             log.warning("IPC append 异常: pipe=%s url=%s: %s", self._ipc_pipe, url, e)
             return False
+
+    def _prune_player_procs(self) -> None:
+        """Drop references to manual player processes that already exited.
+
+        Without this the list only ever grew, leaking one Popen object per
+        manual playback for the lifetime of the app.
+        """
+        if not self._manual_player_procs:
+            return
+        alive: list[subprocess.Popen] = []
+        for proc in self._manual_player_procs:
+            try:
+                if proc.poll() is None:
+                    alive.append(proc)
+            except Exception:
+                continue
+        if len(alive) != len(self._manual_player_procs):
+            self._manual_player_procs[:] = alive
+
+    def _track_player_proc(self, proc: subprocess.Popen) -> None:
+        """Remember a manual player process, pruning the ones already gone."""
+        self._prune_player_procs()
+        self._manual_player_procs.append(proc)
 
     def _stop_player(self) -> None:
         if self._player_proc and self._player_proc.poll() is None:
@@ -3867,6 +3972,10 @@ class App(tk.Tk):
             if mode == "current":
                 self._text_handler.reset_counter()
             _clear_log_files(mode=mode, current_file=self._current_log_file)
+            if mode == "current":
+                # Continue logging into a brand new file, otherwise the next
+                # record re-creates the file we just removed.
+                self._current_log_file = self._text_handler.rotate()
 
     def _load_history_logs(self) -> None:
         """Load historical logs into history log text widget."""
@@ -3880,17 +3989,70 @@ class App(tk.Tk):
             _show_toast(self, "没有找到历史日志")
 
 
-def run() -> None:
-    """Entry point for the GUI."""
+_FT_FILE = None
+
+
+def _enable_crash_dumps():
+    """Enable hard-crash stack dumps; returns the dump file or None."""
+    global _FT_FILE
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         _cleanup_stale_files()
-        _ft_path = LOG_DIR / f"faulthandler-{time.strftime('%Y%m%d-%H%M%S')}.txt"
-        _ft = _ft_path.open("a")
-        faulthandler.dump_traceback_later(45, exit=False, file=_ft)
+        path = LOG_DIR / f"faulthandler-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        _FT_FILE = path.open("a")
+        # Dump only when the process actually crashes. The previous call was
+        # dump_traceback_later(45), which wrote a "Timeout (0:00:45)!" dump on
+        # every healthy run and hid real signals in noise.
+        faulthandler.enable(file=_FT_FILE, all_threads=True)
+        return _FT_FILE
     except Exception:
-        pass
+        return None
+
+
+def _start_hang_watchdog(app: App, ft_file, threshold: float = 90.0, interval: float = 5.0) -> None:
+    """Dump all thread stacks when the Tk main loop stops responding.
+
+    A heartbeat driven by ``after`` runs on the UI thread, so a growing gap
+    means that thread is blocked. Only one dump is written per stall, and no
+    Tk call is ever made from the watchdog thread (that would itself block).
+    """
+    state = {"beat": time.monotonic()}
+
+    def _beat() -> None:
+        state["beat"] = time.monotonic()
+        try:
+            app.after(int(interval * 1000), _beat)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _watch() -> None:
+        while True:
+            time.sleep(interval)
+            if getattr(app, "_closing", False):
+                return
+            lag = time.monotonic() - state["beat"]
+            if lag < threshold:
+                continue
+            try:
+                log.warning("界面已无响应 %.0f 秒，转储全部线程栈到 %s", lag, ft_file.name)
+                faulthandler.dump_traceback(file=ft_file, all_threads=True)
+            except Exception:
+                pass
+            time.sleep(threshold)
+
+    try:
+        app.after(0, _beat)
+    except (tk.TclError, RuntimeError):
+        return
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+def run() -> None:
+    """Entry point for the GUI."""
+    ft_file = _enable_crash_dumps()
     app = App()
+    if ft_file is not None:
+        _start_hang_watchdog(app, ft_file)
     app.mainloop()
 
 

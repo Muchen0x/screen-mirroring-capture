@@ -122,6 +122,13 @@ def capture(
             server = HTTPServer(("", port), UPnPHandler)
             ssdp = SSDPAdvertiser(dev_uuid, location, local_ip)
             ssdp.start()
+            ssdp_error = getattr(ssdp, "error", None)
+            if ssdp_error:
+                print(
+                    f"  ⚠️  DLNA   SSDP 广播异常: {ssdp_error}"
+                    "（UDP 1900 可能被占用，部分控制器将无法搜索到设备）",
+                    file=sys.stderr,
+                )
             threading.Thread(target=server.serve_forever, daemon=True).start()
             cleanups.extend([server.shutdown, ssdp.stop])
             started.append("dlna")

@@ -77,8 +77,8 @@ class UPnPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         routes = {
             "/device.xml": descriptors.DEVICE.format(
-                friendly_name=self.friendly_name,
-                uuid=self.device_uuid,
+                friendly_name=html.escape(self.friendly_name),
+                uuid=html.escape(self.device_uuid),
             ),
             "/AVTransport/scpd.xml": descriptors.AVTRANSPORT_SCPD,
             "/RenderingControl/scpd.xml": descriptors.RENDERING_SCPD,
