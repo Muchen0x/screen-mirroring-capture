@@ -94,6 +94,12 @@ _DEFAULT_PORTS: dict[str, int] = {"dlna": 9090, "airplay": 9091, "cast": 8009}
 # Playlist metadata fields filled in by an asynchronous ffprobe pass.
 _META_FIELDS = ("duration", "resolution", "video_codec", "audio_codec", "bitrate", "fps")
 
+# Window resizes arrive as a flood of <Configure> events (~60/s while a mouse
+# button drags the edge). Re-flowing the content for every one of them costs
+# more than the interval between two events, so the panel is only re-flowed
+# once the drag settles.
+_RESIZE_SETTLE_MS = 180
+
 # How a URL is handed to an already-running mpv over the IPC pipe.
 #   append-play: append to the queue, start only when nothing is playing
 #   replace:     switch to the new URL immediately, dropping the current one
@@ -940,7 +946,11 @@ class ScrollableFrame(ttk.Frame):
         self._inner = ttk.Frame(self._canvas)
         self._inner.bind("<Configure>", lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
         self._canvas_window = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
-        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfig(self._canvas_window, width=e.width))
+        # Same debounce as the main window: re-flowing the inner frame for every
+        # <Configure> of a dialog drag is more work than one frame allows.
+        self._width = 0
+        self._width_sync = _DebouncedCall(self, _RESIZE_SETTLE_MS, self._apply_width)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
@@ -958,12 +968,29 @@ class ScrollableFrame(ttk.Frame):
     def _on_destroy(self, event: tk.Event) -> None:
         if event.widget is not self:
             return
+        self._width_sync.cancel()
         for seq, funcid in self._wheel_bindings:
             try:
                 self._toplevel.unbind(seq, funcid)
             except tk.TclError:
                 pass
         self._wheel_bindings.clear()
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        if self._width <= 0:
+            self._apply_width(event.width)   # first paint: no delay
+        else:
+            self._width_sync(event.width)
+
+    def _apply_width(self, width: int) -> None:
+        """Match the inner frame to the canvas width (debounced)."""
+        if width <= 1 or width == self._width:
+            return
+        self._width = width
+        try:
+            self._canvas.itemconfig(self._canvas_window, width=width)
+        except tk.TclError:
+            pass
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         try:
@@ -985,6 +1012,142 @@ class ScrollableFrame(ttk.Frame):
     @property
     def inner(self) -> ttk.Frame:
         return self._inner
+
+
+class _DebouncedCall:
+    """Run *fn* once, *delay* ms after the calls stop, with the latest args.
+
+    A window edge drag delivers ~60 ``<Configure>`` events per second, and
+    re-flowing the whole panel for each of them costs 100-200 ms here, far
+    more than the gap between two events: the queue never catches up and the
+    window lags behind the cursor.  While the drag continues the timer is
+    pushed back, so the content keeps its previous width (cheap paint only)
+    and is re-flowed exactly once, when the drag settles.
+    """
+
+    def __init__(self, widget: tk.Misc, delay: int, fn) -> None:
+        self._widget = widget
+        self._delay = delay
+        self._fn = fn
+        self._job: str | None = None
+        self._args: tuple = ()
+
+    def __call__(self, *args) -> None:
+        self._args = args
+        if self._job is not None:
+            try:
+                self._widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+        self._job = self._widget.after(self._delay, self._run)
+
+    def _run(self) -> None:
+        self._job = None
+        try:
+            self._fn(*self._args)
+        except tk.TclError:
+            pass
+
+    def cancel(self) -> None:
+        if self._job is not None:
+            try:
+                self._widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+
+
+class FlowFrame(ttk.Frame):
+    """Left-to-right container that wraps its children onto extra rows.
+
+    Children are created once by the caller and handed to :meth:`add`; the
+    frame repositions them with ``place`` when the available width crosses a
+    row boundary.  Nothing is destroyed or recreated, which matters because
+    the previous implementation rebuilt every player button on each
+    ``<Configure>`` and made dragging the window edge stutter.
+
+    ``place`` is used instead of ``grid`` on purpose: grid column widths are
+    shared across rows, so a wrapped row would be pushed right by the wider
+    cells of the row above and overflow the frame.
+    """
+
+    def __init__(self, parent: tk.Widget, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        # Children are placed, not packed, so the frame's height is set by
+        # relayout() and never propagated from its slaves.
+        self._items: list[tuple[tk.Widget, int, int]] = []
+        self._signature: tuple[tuple[int, ...], ...] | None = None
+        self.bind("<Configure>", lambda e: self.relayout(), add="+")
+
+    def add(self, widget: tk.Widget, padx: tuple[int, int] = (0, 0)) -> tk.Widget:
+        """Register *widget* (created with this frame as master) for flow."""
+        self._items.append((widget, padx[0], padx[1]))
+        self._signature = None
+        return widget
+
+    def clear(self) -> None:
+        """Destroy every registered child so the flow can be rebuilt."""
+        for widget, _, _ in self._items:
+            try:
+                if widget.winfo_exists():
+                    widget.destroy()
+            except tk.TclError:
+                pass
+        self._items.clear()
+        self._signature = None
+
+    def relayout(self, force: bool = False) -> None:
+        if force:
+            self._signature = None
+        if not self._items:
+            return
+        available = self.winfo_width()
+        if available <= 1:
+            return
+
+        rows: list[list[int]] = []
+        current: list[int] = []
+        used = 0
+        for idx, (widget, left, right) in enumerate(self._items):
+            try:
+                width = widget.winfo_reqwidth() + left + right
+            except tk.TclError:
+                continue
+            if current and used + width > available:
+                rows.append(current)
+                current = []
+                used = 0
+            current.append(idx)
+            used += width
+        if current:
+            rows.append(current)
+
+        signature = tuple(tuple(r) for r in rows)
+        if signature == self._signature and not force:
+            return
+
+        y = 0
+        for row in rows:
+            row_height = 1
+            for idx in row:
+                try:
+                    row_height = max(row_height, self._items[idx][0].winfo_reqheight())
+                except tk.TclError:
+                    pass
+            x = 0
+            for idx in row:
+                widget, left, right = self._items[idx]
+                try:
+                    widget.place(x=x + left, y=y)
+                    x += widget.winfo_reqwidth() + left + right
+                except tk.TclError:
+                    pass
+            y += row_height
+        try:
+            self.configure(height=max(y, 1))
+        except tk.TclError:
+            pass
+        self._signature = signature
 
 
 def _show_toast(parent: tk.Widget, message: str, duration: int = 2000) -> None:
@@ -2541,6 +2704,7 @@ class App(tk.Tk):
         self._force_direct_var = tk.BooleanVar(value=self._config.get("force_direct", False))
         self._log_tab: str = "current"
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
+        self._drain_job: str | None = None
         self._auto_play_last_url: str = ""
         self._auto_play_last_ts: float = 0.0
         self._layout_in_progress: bool = False
@@ -2589,6 +2753,15 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self._closing = True
+        # Cancel the repeating UI-queue poll and any pending resize re-flow so
+        # no callback fires after the widgets are gone ("invalid command name").
+        for job in (self._drain_job, getattr(self._content_width_sync, "_job", None)):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self._drain_job = None
         try:
             faulthandler.cancel_dump_traceback_later()
         except Exception:
@@ -2623,8 +2796,19 @@ class App(tk.Tk):
             self._content_canvas.configure(scrollregion=self._content_canvas.bbox("all"))
         self._content_frame.bind("<Configure>", _on_content_configure)
 
+        # Re-flowing the content frame is the expensive part of a resize (it
+        # drags every child through the geometry manager), so the width is
+        # applied once the drag settles. The first paint is applied
+        # immediately to avoid a visible jump on startup.
+        self._content_width = 0
+        self._content_width_sync = _DebouncedCall(self, _RESIZE_SETTLE_MS,
+                                                  self._apply_content_width)
+
         def _on_canvas_configure(event):
-            self._content_canvas.itemconfig(self._content_window, width=event.width)
+            if self._content_width <= 0:
+                self._apply_content_width(event.width)
+            else:
+                self._content_width_sync(event.width)
         self._content_canvas.bind("<Configure>", _on_canvas_configure)
 
         def _on_mousewheel(event):
@@ -2647,6 +2831,16 @@ class App(tk.Tk):
         self._content_canvas.bind("<Button-1>", lambda e: self.focus_set())
         self._content_frame.bind("<Button-1>", lambda e: self.focus_set())
         self._paned.add(top_frame, stretch="always")
+
+    def _apply_content_width(self, width: int) -> None:
+        """Match the scrollable content to the canvas width (coalesced)."""
+        if width <= 1 or width == self._content_width:
+            return
+        self._content_width = width
+        try:
+            self._content_canvas.itemconfig(self._content_window, width=width)
+        except tk.TclError:
+            pass
 
     def _build_device_settings(self) -> None:
         pd = dict(padx=8, pady=4)
@@ -2696,14 +2890,14 @@ class App(tk.Tk):
         self._net_combo.bind("<Button-1>", lambda e: self._net_tt.hide(), add="+")
         self._net_combo.bind("<FocusOut>", lambda e: self._net_tt.hide(), add="+")
 
-        row_proto = ttk.Frame(frm_dev)
+        row_proto = FlowFrame(frm_dev)
         row_proto.pack(fill="x", pady=(6, 0))
         self._proto_vars: dict[str, tk.BooleanVar] = {}
         self._port_vars: dict[str, tk.StringVar] = {}
         self._proto_checkbuttons: dict[str, ttk.Checkbutton] = {}
         self._port_entries: dict[str, ttk.Entry] = {}
         saved_protos = self._config.get("protocols", {})
-        for proto in PROTOCOLS:
+        for index, proto in enumerate(PROTOCOLS):
             proto_cfg = saved_protos.get(proto, {})
             enabled = proto_cfg.get("enabled", True)
             # Older configs may hold 0 or garbage; fall back to the default.
@@ -2711,18 +2905,18 @@ class App(tk.Tk):
             var = tk.BooleanVar(value=enabled)
             self._proto_vars[proto] = var
             cb = ttk.Checkbutton(row_proto, text=proto.upper(), variable=var, command=self._save_device_settings)
-            cb.pack(side="left", padx=(0, 2))
+            row_proto.add(cb, padx=(0 if index == 0 else 8, 2))
             self._proto_checkbuttons[proto] = cb
-            ttk.Label(row_proto, text="端口:").pack(side="left")
+            row_proto.add(ttk.Label(row_proto, text="端口:"), padx=(2, 0))
             port_var = tk.StringVar(value=str(port))
             self._port_vars[proto] = port_var
             pe = ttk.Entry(row_proto, textvariable=port_var, width=6)
-            pe.pack(side="left", padx=(2, 12))
+            row_proto.add(pe, padx=(2, 6))
             pe.bind("<FocusOut>", lambda e: self._save_device_settings())
             _bind_enter_commit(pe, self._save_device_settings)
             self._port_entries[proto] = pe
         self._restore_btn = ttk.Button(row_proto, text="恢复默认", command=self._restore_defaults)
-        self._restore_btn.pack(side="left", padx=(8, 0))
+        row_proto.add(self._restore_btn, padx=(8, 0))
 
         self._verbose_var = tk.BooleanVar(value=self._config.get("verbose", False))
 
@@ -2734,18 +2928,19 @@ class App(tk.Tk):
         frm_capture = ttk.LabelFrame(capture_wrapper, text="捕获", padding=8)
         frm_capture.pack(fill="x", expand=True)
 
-        row_ctrl = ttk.Frame(frm_capture)
+        row_ctrl = FlowFrame(frm_capture)
         row_ctrl.pack(fill="x")
         self._start_btn = ttk.Button(row_ctrl, text="▶ 开始", command=self._start, width=10)
-        self._start_btn.pack(side="left", padx=4)
+        row_ctrl.add(self._start_btn, padx=(0, 4))
         self._stop_btn = ttk.Button(row_ctrl, text="⏹ 停止", command=self._stop, width=10, state="disabled")
-        self._stop_btn.pack(side="left", padx=4)
-        ttk.Button(row_ctrl, text="📋 捕获历史", command=self._show_history, width=10).pack(side="left", padx=4)
+        row_ctrl.add(self._stop_btn, padx=(4, 4))
+        row_ctrl.add(ttk.Button(row_ctrl, text="📋 捕获历史", command=self._show_history, width=10),
+                     padx=(4, 4))
         self._status_var = tk.StringVar(value="● 已停止")
         self._status_label = ttk.Label(row_ctrl, textvariable=self._status_var, foreground="red")
-        self._status_label.pack(side="left", padx=16)
+        row_ctrl.add(self._status_label, padx=(12, 8))
         self._continuous_cb = ttk.Checkbutton(row_ctrl, text="持续捕获", variable=self._continuous_var)
-        self._continuous_cb.pack(side="left")
+        row_ctrl.add(self._continuous_cb, padx=(0, 4))
         row_url = ttk.Frame(frm_capture)
         row_url.pack(fill="x", pady=(8, 0))
         self._url_prefix_var = tk.StringVar(value="捕获URL:")
@@ -2773,38 +2968,35 @@ class App(tk.Tk):
         self._remark_btn.pack(side="left", padx=(4, 0))
         self._update_remark_mode()
 
-        self._player_buttons_frame = ttk.Frame(frm_capture)
+        self._player_buttons_frame = FlowFrame(frm_capture)
         self._player_buttons_frame.pack(fill="x", pady=(8, 0))
         self._player_buttons: dict[str, ttk.Button] = {}
-        self._player_btn_list: list[ttk.Widget] = []
-
-        self._edit_btn = ttk.Button(self._player_buttons_frame, text="编辑", command=self._open_player_dialog)
 
         self._layout_player_buttons()
-        self._player_buttons_frame.bind("<Configure>", lambda e: self._layout_player_buttons())
         self._player_buttons_frame.bind("<Button-3>", self._on_player_buttons_right_click)
 
-        row_auto = ttk.Frame(frm_capture)
+        row_auto = FlowFrame(frm_capture)
         row_auto.pack(fill="x", pady=(4, 0))
         self._auto_play_var = tk.BooleanVar(value=self._config.get("auto_play", False))
-        ttk.Checkbutton(row_auto, text="自动播放:", variable=self._auto_play_var,
-                        command=self._save_auto_play_settings).pack(side="left")
+        row_auto.add(ttk.Checkbutton(row_auto, text="自动播放:", variable=self._auto_play_var,
+                                     command=self._save_auto_play_settings))
         player_names = list(self._config.get("players", {}).keys())
         self._auto_play_player_var = tk.StringVar(value=self._config.get("auto_play_player", ""))
         self._auto_play_combo = ttk.Combobox(row_auto, textvariable=self._auto_play_player_var,
                                               values=player_names, width=20, state="readonly")
-        self._auto_play_combo.pack(side="left", padx=(4, 0))
+        row_auto.add(self._auto_play_combo, padx=(4, 0))
         self._auto_play_combo.bind("<<ComboboxSelected>>", lambda e: self.after(10, self.focus_set))
-        ttk.Checkbutton(row_auto, text="杀旧进程", variable=self._manual_kill_prev_var,
-                        command=self._save_manual_kill_settings).pack(side="left", padx=(12, 0))
-        ttk.Checkbutton(row_auto, text="全局直连", variable=self._force_direct_var,
-                        command=self._save_force_direct_settings).pack(side="left", padx=(12, 0))
-        ttk.Label(row_auto, text="防抖(秒):").pack(side="left", padx=(12, 2))
+        row_auto.add(ttk.Checkbutton(row_auto, text="杀旧进程", variable=self._manual_kill_prev_var,
+                                     command=self._save_manual_kill_settings), padx=(12, 0))
+        row_auto.add(ttk.Checkbutton(row_auto, text="全局直连", variable=self._force_direct_var,
+                                     command=self._save_force_direct_settings), padx=(12, 0))
+        row_auto.add(ttk.Label(row_auto, text="防抖(秒):"), padx=(12, 2))
         self._debounce_var = tk.DoubleVar(value=self._config.get("manual_click_debounce", 2.0))
         debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
                                      textvariable=self._debounce_var, width=5)
-        debounce_spin.pack(side="left")
-        ttk.Button(row_auto, text="播放列表", command=self._open_playlist_dialog, width=8).pack(side="left", padx=(8, 0))
+        row_auto.add(debounce_spin, padx=(0, 4))
+        row_auto.add(ttk.Button(row_auto, text="播放列表", command=self._open_playlist_dialog, width=8),
+                     padx=(8, 0))
         def _debounce_wheel(event):
             self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
             return "break"
@@ -2866,7 +3058,10 @@ class App(tk.Tk):
         log_inner = ttk.Frame(self._paned)
         log_inner.pack_propagate(False)
         log_inner.configure(height=135)
-        self._paned.add(log_inner, minsize=70, stretch="never")
+        # stretch="always" lets the log share the extra height when the window
+        # is enlarged; with "never" it stayed at 135 px and the log area never
+        # adapted. Dragging the sash still sets a manual split.
+        self._paned.add(log_inner, minsize=70, stretch="always")
         tk.Frame(log_inner, height=3, bg="#888").pack(fill="x", pady=(0, 4))
 
         row_bottom = ttk.Frame(log_inner)
@@ -3548,111 +3743,44 @@ class App(tk.Tk):
         _save_config(self._config)
 
     def _layout_player_buttons(self) -> None:
+        """Create or re-flow the player buttons for the current width.
+
+        Widgets are only (re)created when the player list actually changed;
+        a plain resize just repositions the existing ones inside the FlowFrame.
+        """
         if self._layout_in_progress:
             return
         self._layout_in_progress = True
         try:
-            self._do_layout_player_buttons()
+            players = list(self._config.get("players", {}))
+            if list(self._player_buttons) != players:
+                self._create_player_buttons(players)
+            self._player_buttons_frame.relayout()
         finally:
             self._layout_in_progress = False
 
+    def _create_player_buttons(self, players: list[str]) -> None:
+        frame = self._player_buttons_frame
+        frame.clear()
+        self._player_buttons.clear()
+        frame.add(ttk.Label(frame, text="播放器:"))
+        for name in players:
+            btn = ttk.Button(frame, text=f"▶ {name}",
+                             command=lambda n=name: self._open_in_player(n))
+            frame.add(btn, padx=(4, 0))
+            self._player_buttons[name] = btn
+        self._edit_btn = ttk.Button(frame, text="编辑", command=self._open_player_dialog)
+        frame.add(self._edit_btn, padx=(4, 0))
+        self._update_player_button_states()
+
     def _on_player_buttons_right_click(self, event: tk.Event) -> None:
         pass
-
-    def _do_layout_player_buttons(self) -> None:
-        frame = self._player_buttons_frame
-        frame.update_idletasks()
-        available = frame.winfo_width()
-        if available < 20:
-            return
-
-        # Measure button widths using temporary hidden widgets (only if not cached)
-        if not hasattr(self, "_player_btn_widths") or not self._player_btn_widths:
-            _temp_lbl = ttk.Label(frame, text="播放器:")
-            _temp_lbl.pack(side="left")
-            _temp_lbl.update_idletasks()
-            lbl_width = _temp_lbl.winfo_width()
-            _temp_lbl.destroy()
-
-            players = self._config.get("players", {})
-            player_widths = []
-            for name in players:
-                btn = ttk.Button(frame, text=f"▶ {name}", state="disabled")
-                btn.pack(side="left", padx=2)
-                btn.update_idletasks()
-                player_widths.append(btn.winfo_width())
-                btn.destroy()
-
-            _temp_edit = ttk.Button(frame, text="编辑")
-            _temp_edit.pack(side="left", padx=(4, 0))
-            _temp_edit.update_idletasks()
-            edit_width = _temp_edit.winfo_width()
-            _temp_edit.destroy()
-
-            self._player_btn_widths = {
-                "label": lbl_width,
-                "players": {name: w for name, w in zip(players.keys(), player_widths)},
-                "edit": edit_width,
-            }
-        lbl_width = self._player_btn_widths["label"]
-        player_widths_dict = self._player_btn_widths["players"]
-        edit_width = self._player_btn_widths["edit"]
-
-        # Build width list: [label, player1, player2, ..., edit]
-        players = self._config.get("players", {})
-        all_widths = [lbl_width] + [player_widths_dict.get(n, 80) for n in players] + [edit_width]
-        all_names = ["__label__"] + list(players.keys()) + ["__edit__"]
-
-        # Calculate row groupings
-        rows: list[list[int]] = []
-        current_row: list[int] = []
-        x = 0
-        for idx, w in enumerate(all_widths):
-            gap = 4 if idx > 0 else 0
-            space = w + gap
-            if current_row and x + space > available:
-                rows.append(current_row)
-                current_row = []
-                x = 0
-            current_row.append(idx)
-            x += space
-        if current_row:
-            rows.append(current_row)
-
-        # Destroy all existing children
-        for child in list(frame.winfo_children()):
-            child.destroy()
-        self._player_btn_list.clear()
-
-        # Create real widgets inside row frames
-        state = "normal" if (self._url_var.get() or self._playlist_urls) else "disabled"
-        for row_indices in rows:
-            row_frame = ttk.Frame(frame)
-            row_frame.pack(anchor="w", pady=1)
-            for idx in row_indices:
-                name = all_names[idx]
-                if name == "__label__":
-                    lbl = ttk.Label(row_frame, text="播放器:")
-                    lbl.pack(side="left")
-                    self._player_btn_list.append(lbl)
-                elif name == "__edit__":
-                    self._edit_btn = ttk.Button(row_frame, text="编辑", command=self._open_player_dialog)
-                    self._edit_btn.pack(side="left", padx=(4, 0))
-                    self._player_btn_list.append(self._edit_btn)
-                else:
-                    btn = ttk.Button(row_frame, text=f"▶ {name}",
-                                     command=lambda n=name: self._open_in_player(n),
-                                     state=state)
-                    btn.pack(side="left", padx=2)
-                    self._player_buttons[name] = btn
-                    self._player_btn_list.append(btn)
 
     def _rebuild_player_buttons(self) -> None:
         """Rebuild the player buttons in the capture card."""
         if not hasattr(self, "_player_buttons_frame"):
             return
         self._player_buttons.clear()
-        self._player_btn_widths = None
         self._layout_player_buttons()
 
     def _update_player_button_states(self) -> None:
@@ -3985,6 +4113,8 @@ class App(tk.Tk):
         self._ui_queue.put((fn, args))
 
     def _drain_pending_calls(self) -> None:
+        if self._closing:
+            return
         while True:
             try:
                 fn, args = self._ui_queue.get_nowait()
@@ -3994,7 +4124,7 @@ class App(tk.Tk):
                 fn(*args)
             except Exception:
                 pass
-        self.after(50, self._drain_pending_calls)
+        self._drain_job = self.after(50, self._drain_pending_calls)
 
     def _show_status(self, text: str, color: str) -> None:
         self._status_var.set(text)
