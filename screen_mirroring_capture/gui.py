@@ -209,6 +209,15 @@ def _bind_enter_commit(entry: tk.Misc, commit=None) -> None:
     entry.bind("<KP_Enter>", handler)
 
 
+# The capture card uses one button for start/stop.  Three labels keep the
+# button width stable while telling the three states apart.
+_RUN_BTN_TEXT = {
+    "idle": "▶ 开始",
+    "running": "⏹ 停止",
+    "stopping": "⏳ 停止中",
+}
+
+
 def _log_stderr(proc: subprocess.Popen, prefix: str = "") -> None:
     _MAX_LINE = 4000
 
@@ -2930,17 +2939,23 @@ class App(tk.Tk):
 
         row_ctrl = FlowFrame(frm_capture)
         row_ctrl.pack(fill="x")
-        self._start_btn = ttk.Button(row_ctrl, text="▶ 开始", command=self._start, width=10)
-        row_ctrl.add(self._start_btn, padx=(0, 4))
-        self._stop_btn = ttk.Button(row_ctrl, text="⏹ 停止", command=self._stop, width=10, state="disabled")
-        row_ctrl.add(self._stop_btn, padx=(4, 4))
-        row_ctrl.add(ttk.Button(row_ctrl, text="📋 捕获历史", command=self._show_history, width=10),
-                     padx=(4, 4))
+        # Order asked for: state | start/stop | continuous | history | playlist.
+        # The label gets a fixed width so the growing text ("持续捕获中 (12)")
+        # cannot push the buttons around while a capture is running.  17 chars
+        # covers the longest string ("● 已停止 (共 999 个)", 113 px).
         self._status_var = tk.StringVar(value="● 已停止")
-        self._status_label = ttk.Label(row_ctrl, textvariable=self._status_var, foreground="red")
-        row_ctrl.add(self._status_label, padx=(12, 8))
+        self._status_label = ttk.Label(row_ctrl, textvariable=self._status_var,
+                                       foreground="red", width=17, anchor="w")
+        row_ctrl.add(self._status_label, padx=(0, 8))
+        self._run_btn = ttk.Button(row_ctrl, text=_RUN_BTN_TEXT["idle"],
+                                   command=self._toggle_capture, width=10)
+        row_ctrl.add(self._run_btn, padx=(0, 12))
         self._continuous_cb = ttk.Checkbutton(row_ctrl, text="持续捕获", variable=self._continuous_var)
-        row_ctrl.add(self._continuous_cb, padx=(0, 4))
+        row_ctrl.add(self._continuous_cb, padx=(0, 16))
+        row_ctrl.add(ttk.Button(row_ctrl, text="📋 捕获历史", command=self._show_history, width=10),
+                     padx=(0, 4))
+        row_ctrl.add(ttk.Button(row_ctrl, text="▶ 播放列表", command=self._open_playlist_dialog, width=11),
+                     padx=(0, 4))
         row_url = ttk.Frame(frm_capture)
         row_url.pack(fill="x", pady=(8, 0))
         self._url_prefix_var = tk.StringVar(value="捕获URL:")
@@ -2995,8 +3010,6 @@ class App(tk.Tk):
         debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
                                      textvariable=self._debounce_var, width=5)
         row_auto.add(debounce_spin, padx=(0, 4))
-        row_auto.add(ttk.Button(row_auto, text="播放列表", command=self._open_playlist_dialog, width=8),
-                     padx=(8, 0))
         def _debounce_wheel(event):
             self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
             return "break"
@@ -3263,12 +3276,34 @@ class App(tk.Tk):
         threading.Thread(
             target=self._capture_thread_fn,
             args=(self._config["device_name"], ports, protos, bind_ip, audio_output),
+            # Read the Tk variable on this (UI) thread: the worker must not touch Tk.
+            kwargs={"continuous": self._continuous_var.get()},
             daemon=True,
         ).start()
 
     def _stop(self) -> None:
+        # Calling this twice is harmless (the event is just re-set): the button
+        # stays live while "停止中" so a stuck shutdown never locks the UI.
         self._stop_event.set()
+        self._set_run_state("stopping")
         self._show_status("● 正在停止...", "orange")
+
+    def _toggle_capture(self) -> None:
+        """Single button: start when idle, stop when running."""
+        if self._running:
+            self._stop()
+        else:
+            self._start()
+
+    def _set_run_state(self, mode: str) -> None:
+        """Update the merged start/stop button (idle / running / stopping)."""
+        if not hasattr(self, "_run_btn"):
+            return
+        text = _RUN_BTN_TEXT.get(mode, _RUN_BTN_TEXT["idle"])
+        try:
+            self._run_btn.configure(text=text)
+        except tk.TclError:
+            pass
 
     def _open_in_player(self, player_name: str, url: str | None = None) -> None:
         """Open captured URL in a specific player by name."""
@@ -3820,6 +3855,7 @@ class App(tk.Tk):
         self, name: str, ports: dict[str, int], protocols: list[str],
         bind_ip: str = "",
         audio_output: str | None = None, audio_duration: float | None = None,
+        continuous: bool = False,
     ) -> None:
         try:
             url = capture(
@@ -3830,7 +3866,7 @@ class App(tk.Tk):
                 on_play=lambda: self._call_ui(self._on_auto_play),
                 audio_output=audio_output, audio_duration=audio_duration,
                 bind_ip=bind_ip or None,
-                continuous=self._continuous_var.get(),
+                continuous=continuous,
             )
             if url is None:
                 pass
@@ -4081,8 +4117,7 @@ class App(tk.Tk):
     def _set_running(self, running: bool) -> None:
         self._running = running
         if running:
-            self._start_btn.configure(state="disabled")
-            self._stop_btn.configure(state="normal")
+            self._set_run_state("running")
             self._show_status("● 运行中...", "green")
             # Disable device settings
             self._name_entry.configure(state="disabled")
@@ -4093,8 +4128,7 @@ class App(tk.Tk):
             self._restore_btn.configure(state="disabled")
             self._continuous_cb.configure(state="disabled")
         else:
-            self._start_btn.configure(state="normal")
-            self._stop_btn.configure(state="disabled")
+            self._set_run_state("idle")
             # Enable device settings
             self._name_entry.configure(state="normal")
             self._net_combo.configure(state="readonly")
@@ -4105,7 +4139,7 @@ class App(tk.Tk):
             self._continuous_cb.configure(state="normal")
             cnt = self._capture_count
             if cnt and self._continuous_var.get():
-                self._show_status(f"● 已停止 (共捕获 {cnt} 个)", "red")
+                self._show_status(f"● 已停止 (共 {cnt} 个)", "red")
             else:
                 self._show_status("● 已停止", "red")
 
