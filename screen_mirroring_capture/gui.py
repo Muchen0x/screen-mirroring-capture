@@ -169,6 +169,40 @@ def _parse_port(raw: object) -> int | None:
     return value if 1 <= value <= 65535 else None
 
 
+# ttk draws a dotted focus ring as soon as a button-like widget holds keyboard
+# focus, and a plain mouse click is enough to hand it that focus.  These helpers
+# keep the ring off mouse interaction without touching Tab navigation.
+_BUTTON_CLASSES = frozenset({
+    "TButton", "TCheckbutton", "TRadiobutton", "TMenubutton",
+})
+
+
+def _drop_focus(widget: tk.Misc) -> None:
+    """Hand keyboard focus from *widget* back to its window."""
+    try:
+        if widget.focus_get() is widget:
+            widget.winfo_toplevel().focus_set()
+    except (tk.TclError, KeyError, AttributeError):
+        pass
+
+
+def _bind_enter_commit(entry: tk.Misc, commit=None) -> None:
+    """Make Enter commit the value of *entry* and release its keyboard focus."""
+
+    def handler(event: tk.Event | None = None) -> str:
+        try:
+            if commit is not None:
+                commit()
+        except Exception:
+            log.exception("回车提交失败: %r", entry)
+        finally:
+            _drop_focus(entry)
+        return "break"
+
+    entry.bind("<Return>", handler)
+    entry.bind("<KP_Enter>", handler)
+
+
 def _log_stderr(proc: subprocess.Popen, prefix: str = "") -> None:
     _MAX_LINE = 4000
 
@@ -1644,7 +1678,7 @@ class RecordDialog(tk.Toplevel):
         self._url_entry = ttk.Entry(frm_url, textvariable=self._url_var, width=40)
         self._url_entry.pack(fill="x")
         self._url_entry.bind("<KeyRelease>", self._on_url_changed)
-        self._url_entry.bind("<Return>", self._on_url_changed)
+        _bind_enter_commit(self._url_entry, self._on_url_changed)
 
         # Save directory
         frm_dir = ttk.LabelFrame(content, text="存储目录", padding=8)
@@ -1652,7 +1686,9 @@ class RecordDialog(tk.Toplevel):
         row_dir = ttk.Frame(frm_dir)
         row_dir.pack(fill="x")
         self._dir_var = tk.StringVar(value=save_dir)
-        ttk.Entry(row_dir, textvariable=self._dir_var, width=40).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._dir_entry = ttk.Entry(row_dir, textvariable=self._dir_var, width=40)
+        self._dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        _bind_enter_commit(self._dir_entry, self._commit_dir)
         ttk.Button(row_dir, text="浏览...", command=self._browse_dir).pack(side="left")
 
         # Filename
@@ -1662,6 +1698,7 @@ class RecordDialog(tk.Toplevel):
         self._name_entry = ttk.Entry(frm_name, textvariable=self._name_var, width=40)
         self._name_entry.pack(fill="x")
         self._name_entry.bind("<KeyRelease>", lambda e: self._update_preview())
+        _bind_enter_commit(self._name_entry, self._commit_name)
 
         # Format
         frm_fmt = ttk.LabelFrame(content, text="格式 (自动匹配，可手动切换)", padding=8)
@@ -1764,6 +1801,16 @@ class RecordDialog(tk.Toplevel):
         if path:
             self._dir_var.set(path)
             self._update_preview()
+
+    def _commit_dir(self) -> None:
+        """Trim the directory typed by hand and refresh the path preview."""
+        self._dir_var.set(self._dir_var.get().strip())
+        self._update_preview()
+
+    def _commit_name(self) -> None:
+        """Trim the file name typed by hand and refresh the path preview."""
+        self._name_var.set(self._name_var.get().strip())
+        self._update_preview()
 
     def _on_format_change(self, event: tk.Event) -> None:
         self._fmt_touched = True
@@ -2115,6 +2162,7 @@ class PlayerDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="取消", command=cancel, width=8).grid(row=0, column=1, padx=4)
         ttk.Button(btn_frame, text="确定", command=confirm, width=8).grid(row=0, column=3, padx=4)
         name_entry.bind("<Return>", lambda e: confirm())
+        path_entry.bind("<Return>", lambda e: confirm())
 
         dialog.update_idletasks()
         pw, ph = self.winfo_width(), self.winfo_height()
@@ -2239,6 +2287,7 @@ class PlayerDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="取消", command=cancel, width=8).grid(row=0, column=1, padx=4)
         ttk.Button(btn_frame, text="确定", command=confirm, width=8).grid(row=0, column=3, padx=4)
         name_entry.bind("<Return>", lambda e: confirm())
+        path_entry.bind("<Return>", lambda e: confirm())
 
         dialog.update_idletasks()
         pw, ph = self.winfo_width(), self.winfo_height()
@@ -2504,10 +2553,19 @@ class App(tk.Tk):
 
     def _on_global_click(self, event) -> None:
         w = event.widget
+        try:
+            cls = w.winfo_class()
+        except tk.TclError:
+            return
+        if cls in _BUTTON_CLASSES:
+            # ttk hands keyboard focus to the clicked button, and the theme then
+            # paints a dotted focus ring around it; give the focus back so the
+            # ring disappears as soon as the click is over.
+            _drop_focus(w)
+            return
         if isinstance(w, (
-            ttk.Button, ttk.Entry, ttk.Combobox, tk.Text,
-            ttk.Spinbox, ttk.Checkbutton, ttk.Radiobutton,
-            tk.Listbox, ttk.Scrollbar, ttk.Progressbar,
+            ttk.Entry, ttk.Combobox, tk.Text,
+            ttk.Spinbox, tk.Listbox, ttk.Scrollbar, ttk.Progressbar,
         )):
             return
         try:
@@ -2607,6 +2665,7 @@ class App(tk.Tk):
         self._name_entry = ttk.Entry(row1, textvariable=self._name_var)
         self._name_entry.grid(row=0, column=1, sticky="ew", padx=(4, 16))
         self._name_entry.bind("<FocusOut>", lambda e: self._save_device_settings())
+        _bind_enter_commit(self._name_entry, self._commit_device_name)
 
         ttk.Label(row1, text="网络:").grid(row=0, column=2, sticky="w")
         self._bind_ip_var = tk.StringVar(value=self._config.get("bind_ip", ""))
@@ -2660,6 +2719,7 @@ class App(tk.Tk):
             pe = ttk.Entry(row_proto, textvariable=port_var, width=6)
             pe.pack(side="left", padx=(2, 12))
             pe.bind("<FocusOut>", lambda e: self._save_device_settings())
+            _bind_enter_commit(pe, self._save_device_settings)
             self._port_entries[proto] = pe
         self._restore_btn = ttk.Button(row_proto, text="恢复默认", command=self._restore_defaults)
         self._restore_btn.pack(side="left", padx=(8, 0))
@@ -2752,6 +2812,7 @@ class App(tk.Tk):
         debounce_spin.bind("<Button-4>", _debounce_wheel)
         debounce_spin.bind("<Button-5>", _debounce_wheel)
         debounce_spin.bind("<FocusOut>", lambda e: self._save_debounce_settings())
+        _bind_enter_commit(debounce_spin, self._save_debounce_settings)
 
     def _build_recording_panel(self) -> None:
         pd = dict(padx=8, pady=4)
@@ -2767,6 +2828,7 @@ class App(tk.Tk):
         self._save_dir_var = tk.StringVar(value=self._config.get("save_dir", ""))
         self._save_dir_entry = ttk.Entry(row_rec, textvariable=self._save_dir_var, width=40)
         self._save_dir_entry.pack(side="left", padx=(4, 4), fill="x", expand=True)
+        _bind_enter_commit(self._save_dir_entry, self._commit_save_dir)
         ttk.Button(row_rec, text="浏览", command=self._browse_dir).pack(side="left")
 
         row_audio = ttk.Frame(frm_rec)
@@ -2777,6 +2839,7 @@ class App(tk.Tk):
         self._audio_output_var = tk.StringVar(value=self._config.get("audio_output", ""))
         self._audio_output_entry = ttk.Entry(row_audio, textvariable=self._audio_output_var, width=30)
         self._audio_output_entry.pack(side="left", padx=(8, 0), fill="x", expand=True)
+        _bind_enter_commit(self._audio_output_entry, self._commit_audio_output)
         ttk.Button(row_audio, text="浏览", command=self._browse_audio_dir).pack(side="left")
 
         self._progress_var = tk.StringVar(value="")
@@ -2866,6 +2929,11 @@ class App(tk.Tk):
         self._config["save_dir"] = self._save_dir_var.get().strip()
         _save_config(self._config)
 
+    def _commit_save_dir(self) -> None:
+        """Trim the path shown in the entry, then persist it."""
+        self._save_dir_var.set(self._save_dir_var.get().strip())
+        self._save_dir_changed()
+
     def _browse_audio_dir(self) -> None:
         path = filedialog.askdirectory(title="选择音频保存目录", parent=self)
         if path:
@@ -2876,6 +2944,17 @@ class App(tk.Tk):
         self._config["audio_output"] = self._audio_output_var.get().strip()
         self._config["audio_record"] = self._audio_rec_var.get()
         _save_config(self._config)
+
+    def _commit_audio_output(self) -> None:
+        """Trim the path shown in the entry, then persist it."""
+        self._audio_output_var.set(self._audio_output_var.get().strip())
+        self._save_audio_output()
+
+    def _commit_device_name(self) -> None:
+        """Trim the name and keep the entry showing what was actually stored."""
+        name = self._name_var.get().strip() or "screen-mirroring-capture"
+        self._name_var.set(name)
+        self._save_device_settings()
 
     def _restore_defaults(self) -> None:
         self._name_var.set("screen-mirroring-capture")
@@ -3448,12 +3527,14 @@ class App(tk.Tk):
     def _save_debounce_settings(self) -> None:
         try:
             val = self._debounce_var.get()
-            val = max(0.5, min(10.0, val))
-            self._debounce_var.set(val)
-            self._config["manual_click_debounce"] = val
-            _save_config(self._config)
-        except Exception:
-            pass
+        except (tk.TclError, ValueError):
+            # Unparseable text (e.g. the box was cleared): fall back to the
+            # value that is actually in effect instead of leaving it on screen.
+            val = self._config.get("manual_click_debounce", 2.0)
+        val = max(0.5, min(10.0, val))
+        self._debounce_var.set(val)
+        self._config["manual_click_debounce"] = val
+        _save_config(self._config)
 
     def _open_playlist_dialog(self) -> None:
         PlaylistDialog(self)
