@@ -102,6 +102,8 @@ screen-mirroring-capture-gui
 python -m screen_mirroring_capture --gui
 ```
 
+> **单实例**：GUI 同一时间只允许一个窗口。已有实例在运行时，再次启动不会打开第二个窗口，而是把已有窗口从最小化恢复并置顶，本次启动随即退出（退出码 `3`，`run.bat` 已针对它做处理，不会留下一个等待按键的控制台）。这样可以避免两个实例争用同一个设备名和同一组端口。
+
 **GUI 功能说明：**
 
 1. **设备设置**：
@@ -210,6 +212,7 @@ screen-mirroring-capture/
 │   ├── descriptors.py      # XML 描述符
 │   ├── net.py              # 网络工具
 │   ├── pairing.py          # HAP 配对
+│   ├── single_instance.py  # GUI 单实例守卫
 │   └── generated/          # Protobuf 生成文件
 ├── pyproject.toml          # 项目配置
 ├── LICENSE                 # GPL-3.0 许可证

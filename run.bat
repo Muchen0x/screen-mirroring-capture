@@ -19,4 +19,9 @@ if not exist venv\ (
     call venv\Scripts\activate
 )
 python -m screen_mirroring_capture --gui
+set "RC=%errorlevel%"
+rem Exit code 3 means another instance was already running and was brought to
+rem the front, so there is no output to read - don't leave a console waiting.
+if "%RC%"=="3" exit /b 0
 pause
+exit /b %RC%

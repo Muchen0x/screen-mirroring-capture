@@ -28,6 +28,17 @@ from typing import Callable
 
 from . import PROTOCOLS, capture
 from .net import get_lan_ip, list_adapters
+from .single_instance import (
+    EXIT_ALREADY_RUNNING,
+    SingleInstance,
+    find_window,
+    force_foreground,
+    window_handle,
+)
+
+#: Window title — also used to find the running instance when the activation
+#: event is unavailable (e.g. the owner failed to create it).
+APP_TITLE = "screen-mirroring-capture v1.6.0"
 
 log = logging.getLogger(__name__)
 
@@ -2666,7 +2677,7 @@ class App(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("screen-mirroring-capture v1.6.0")
+        self.title(APP_TITLE)
         try:
             if getattr(sys, "frozen", False):
                 _base = Path(sys._MEIPASS) / "assets"
@@ -2759,6 +2770,39 @@ class App(tk.Tk):
                         pass
                 _recursive(child)
         _recursive(self)
+
+    def _bring_to_front(self) -> None:
+        """Raise the window (and any open dialog) after a duplicate launch.
+
+        Runs on the UI thread, marshalled from the single-instance listener.
+        """
+        top = self
+        try:
+            grabber = self.grab_current()
+            if grabber is not None and grabber.winfo_exists():
+                top = grabber.winfo_toplevel()
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+            self.lift()
+            if top is not self:
+                top.lift()
+            # A short topmost blip is the only reliable way to surface a window
+            # that Windows considers "background"; it is dropped right after.
+            self.attributes("-topmost", True)
+            self.after(250, self._drop_topmost)
+            self.focus_force()
+        except tk.TclError:
+            return
+        force_foreground(window_handle(self))
+
+    def _drop_topmost(self) -> None:
+        try:
+            self.attributes("-topmost", False)
+        except tk.TclError:
+            pass
 
     def _on_close(self) -> None:
         self._closing = True
@@ -4340,13 +4384,39 @@ def _start_hang_watchdog(app: App, ft_file, threshold: float = 90.0, interval: f
     threading.Thread(target=_watch, daemon=True).start()
 
 
+# Kept at module level so the mutex/event handles live as long as the process.
+_instance_guard: SingleInstance | None = None
+
+
 def run() -> None:
-    """Entry point for the GUI."""
+    """Entry point for the GUI.
+
+    Only one GUI may run at a time: a duplicate launch raises the existing
+    window and exits with :data:`EXIT_ALREADY_RUNNING` instead of opening a
+    second window that would fight over the same device name and ports.
+    """
+    global _instance_guard
+    guard = SingleInstance()
+    _instance_guard = guard
+    if not guard.acquire():
+        # Prefer the activation event; fall back to locating the window by title
+        # when the owner could not create the event.
+        raised = guard.request_activate() or force_foreground(find_window(APP_TITLE))
+        if raised:
+            log.info("已有实例在运行，已把它调到前台，本次启动退出")
+        else:
+            log.warning("已有实例在运行，但未能把它调到前台，本次启动退出")
+        raise SystemExit(EXIT_ALREADY_RUNNING)
+
     ft_file = _enable_crash_dumps()
     app = App()
+    guard.listen(lambda: app._call_ui(app._bring_to_front))
     if ft_file is not None:
         _start_hang_watchdog(app, ft_file)
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":
