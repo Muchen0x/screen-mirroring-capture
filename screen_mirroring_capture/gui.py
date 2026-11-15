@@ -94,6 +94,29 @@ _DEFAULT_PORTS: dict[str, int] = {"dlna": 9090, "airplay": 9091, "cast": 8009}
 # Playlist metadata fields filled in by an asynchronous ffprobe pass.
 _META_FIELDS = ("duration", "resolution", "video_codec", "audio_codec", "bitrate", "fps")
 
+# How a URL is handed to an already-running mpv over the IPC pipe.
+#   append-play: append to the queue, start only when nothing is playing
+#   replace:     switch to the new URL immediately, dropping the current one
+IPC_MODE_QUEUE = "append-play"
+IPC_MODE_REPLACE = "replace"
+IPC_MODES = (IPC_MODE_QUEUE, IPC_MODE_REPLACE)
+
+_IPC_MODE_HINT = (
+    "mpv 正在运行时的点播方式：\n\n"
+    "▸ 排队（append-play）\n"
+    "  新 URL 追加到 mpv 队列，当前内容播完后接着播，\n"
+    "  不打断正在看的内容；空闲时自动开始播放\n\n"
+    "▸ 立即切换（replace）\n"
+    "  立刻用新 URL 替换当前正在播放的内容，不排队"
+)
+
+
+def _get_ipc_mode(config: dict) -> str:
+    """Return the configured IPC loadfile mode, falling back to queueing."""
+    mode = config.get("mpv_ipc_mode", IPC_MODE_QUEUE)
+    return mode if mode in IPC_MODES else IPC_MODE_QUEUE
+
+
 _PROTOCOL_HELP = (
     "各协议选项含义：\n\n"
     "▸ auto（自动模式）— 推荐\n"
@@ -110,8 +133,9 @@ _PROTOCOL_HELP = (
     "  MPC-BE、mpv 等\n\n"
     "▸ ipc（进程通信模式）— 仅 mpv\n"
     "  不启动新进程，通过 Windows 命名管道\n"
-    "  向已有 mpv 发送 loadfile 指令，实现\n"
-    "  无缝切换播放内容"
+    "  向已有 mpv 发送 loadfile 指令。是排队\n"
+    "  还是立即切换，可在播放列表窗口底部的\n"
+    "  「播放方式」按钮里切换"
 )
 
 def _get_player_path(entry: str | dict) -> str:
@@ -1325,6 +1349,10 @@ class PlaylistDialog(tk.Toplevel):
                         command=self._on_auto_dedupe_toggle).pack(side="left", padx=4)
         ttk.Button(frm_btn, text="去重", command=self._on_dedupe_click, width=8).pack(side="left", padx=4)
         ttk.Button(frm_btn, text="添加当前URL", command=self._on_add_current, width=10).pack(side="left", padx=4)
+        self._ipc_mode_btn = ttk.Button(frm_btn, text="", width=16, command=self._on_toggle_ipc_mode)
+        self._ipc_mode_btn.pack(side="left", padx=(12, 4))
+        ToolTip(self._ipc_mode_btn, lambda: _IPC_MODE_HINT)
+        self._refresh_ipc_mode_button()
         ttk.Button(frm_btn, text="清空", command=self._on_clear_click, width=8).pack(side="right", padx=4)
         ttk.Button(frm_btn, text="关闭", command=self.destroy, width=8).pack(side="right", padx=4)
 
@@ -1550,6 +1578,24 @@ class PlaylistDialog(tk.Toplevel):
     def _on_auto_dedupe_toggle(self) -> None:
         self._parent._config["auto_dedupe"] = self._auto_dedupe_var.get()
         _save_config(self._parent._config)
+
+    def _refresh_ipc_mode_button(self) -> None:
+        mode = _get_ipc_mode(self._parent._config)
+        self._ipc_mode_btn.configure(
+            text="播放方式: 立即切换" if mode == IPC_MODE_REPLACE else "播放方式: 排队"
+        )
+
+    def _on_toggle_ipc_mode(self) -> None:
+        current = _get_ipc_mode(self._parent._config)
+        new_mode = IPC_MODE_REPLACE if current == IPC_MODE_QUEUE else IPC_MODE_QUEUE
+        self._parent._config["mpv_ipc_mode"] = new_mode
+        _save_config(self._parent._config)
+        self._refresh_ipc_mode_button()
+        log.info("mpv 点播方式切换为: %s", new_mode)
+        if new_mode == IPC_MODE_REPLACE:
+            _show_toast(self, "点播将立即切换，不排队")
+        else:
+            _show_toast(self, "点播将加入队列，播完当前内容再播")
 
 
 # ── Record dialog ──────────────────────────────────────────────
@@ -3026,7 +3072,7 @@ class App(tk.Tk):
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
             log.debug("    IPC 追加: pipe=%s url=%s", self._ipc_pipe, url[:60])
             self._write_playlist()
-            if self._mpv_ipc_append(url, "append-play"):
+            if self._mpv_ipc_append(url, _get_ipc_mode(self._config)):
                 log.debug("    IPC append 成功")
                 return True
             log.debug("    IPC 追加失败，回退到新进程")
@@ -3157,7 +3203,7 @@ class App(tk.Tk):
         if is_playlist and "mpv" in stem and self._ipc_pipe and self._player_proc and self._player_proc.poll() is None:
             log.debug("    IPC 追加尝试: pipe=%s gen=%d url=%s", self._ipc_pipe, getattr(self, "_mpv_generation", 0), url[:60])
             self._write_playlist()
-            if self._mpv_ipc_append(url, "append-play"):
+            if self._mpv_ipc_append(url, _get_ipc_mode(self._config)):
                 log.debug("    <<< IPC append 成功")
                 return True
             log.debug("    IPC 追加失败，将重启进程")
