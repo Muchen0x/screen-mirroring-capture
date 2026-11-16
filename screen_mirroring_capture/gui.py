@@ -38,7 +38,7 @@ from .single_instance import (
 
 #: Window title — also used to find the running instance when the activation
 #: event is unavailable (e.g. the owner failed to create it).
-APP_TITLE = "screen-mirroring-capture v1.6.0"
+APP_TITLE = "screen-mirroring-capture v1.7.0"
 
 log = logging.getLogger(__name__)
 
@@ -201,6 +201,78 @@ def _drop_focus(widget: tk.Misc) -> None:
             widget.winfo_toplevel().focus_set()
     except (tk.TclError, KeyError, AttributeError):
         pass
+
+
+def _combo_popdown_open(combo: tk.Misc) -> bool:
+    """Is *combo*'s dropdown list currently posted?
+
+    Taking the keyboard focus away while it is would make the popdown's
+    ``<FocusOut>`` handler cancel it (ttk/combobox.tcl), so callers must ask
+    first.  The path is spelled out by hand on purpose: the ttk helper
+    ``ttk::combobox::PopdownWindow`` creates the window as a side effect.
+    """
+    try:
+        popdown = f"{combo}.popdown"
+        if not int(combo.tk.call("winfo", "exists", popdown)):
+            return False
+        return bool(int(combo.tk.call("winfo", "ismapped", popdown)))
+    except (tk.TclError, ValueError):
+        return False
+
+
+def _scroll_canvas_of(widget: tk.Misc) -> tk.Canvas | None:
+    """Closest scrollable canvas above *widget*, if it lives in one.
+
+    Dialogs use :class:`ScrollableFrame`; the main window passes its own
+    canvas explicitly because it does not.
+    """
+    w = getattr(widget, "master", None)
+    while w is not None:
+        if isinstance(w, ScrollableFrame):
+            return w._canvas
+        w = getattr(w, "master", None)
+    return None
+
+
+def _bind_wheel_scroll(widget: tk.Misc, canvas: tk.Canvas) -> None:
+    """Swallow the wheel on *widget* and scroll *canvas* instead."""
+
+    def _wheel(event: tk.Event) -> str:
+        try:
+            up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
+            canvas.yview_scroll(-1 if up else 1, "units")
+        except tk.TclError:
+            pass
+        return "break"
+
+    for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        widget.bind(seq, _wheel, add="+")
+
+
+def _tame_combobox(combo: ttk.Combobox, canvas: tk.Canvas | None = None) -> None:
+    """Make *combo* mouse-proof: wheel scrolls the page, clicks leave no ring.
+
+    ttk binds the wheel on the ``TCombobox`` class to ``SelectEntry``, which
+    silently swaps the value; a widget-level binding that returns ``"break"``
+    runs first and stops that.  The dotted focus ring comes from the theme
+    painting the focus element after the popdown hands the keyboard focus back
+    (``focus $cb``), which only ``<<ComboboxSelected>>`` cannot cover: opening
+    and closing the list without picking anything fires no event at all.
+    """
+
+    target = canvas or _scroll_canvas_of(combo)
+    if target is not None:
+        _bind_wheel_scroll(combo, target)
+    else:
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            combo.bind(seq, lambda _e: "break", add="+")
+
+    def _release(_event: tk.Event | None = None) -> None:
+        if not _combo_popdown_open(combo):
+            _drop_focus(combo)
+
+    combo.bind("<FocusIn>", _release, add="+")          # main path: list just closed
+    combo.bind("<ButtonRelease-1>", _release, add="+")  # safety net after a click
 
 
 def _bind_enter_commit(entry: tk.Misc, commit=None) -> None:
@@ -1170,8 +1242,56 @@ class FlowFrame(ttk.Frame):
         self._signature = signature
 
 
+def _app_icon_path() -> Path | None:
+    """``assets/icon.ico``, or ``None`` when it is missing."""
+    try:
+        if getattr(sys, "frozen", False):
+            base = Path(sys._MEIPASS) / "assets"
+        else:
+            base = Path(__file__).resolve().parent.parent / "assets"
+        icon = base / "icon.ico"
+        return icon if icon.exists() else None
+    except Exception:
+        return None
+
+
+def _apply_window_icon(window: tk.Tk | tk.Toplevel) -> None:
+    """Put the app icon on *window*.
+
+    Tk does not inherit ``iconbitmap`` between windows -- ``-default`` is a
+    no-op on Windows -- so every Toplevel has to set it itself, otherwise it
+    keeps the stock feather icon in its title bar and taskbar entry.
+    """
+    icon = _app_icon_path()
+    if icon is None:
+        return
+    try:
+        window.iconbitmap(str(icon))
+    except Exception:
+        pass
+
+
+def _new_toplevel(master: tk.Misc, **kwargs) -> tk.Toplevel:
+    """``tk.Toplevel`` that already carries the app icon."""
+    window = tk.Toplevel(master, **kwargs)
+    _apply_window_icon(window)
+    return window
+
+
+class _DialogToplevel(tk.Toplevel):
+    """Base class for the app's dialogs, so none of them keeps the feather icon.
+
+    A subclass never goes through :func:`_new_toplevel`, which is why the icon
+    has to be applied here as well.
+    """
+
+    def __init__(self, master: tk.Misc | None = None, **kwargs):
+        super().__init__(master, **kwargs)
+        _apply_window_icon(self)
+
+
 def _show_toast(parent: tk.Widget, message: str, duration: int = 2000) -> None:
-    toast = tk.Toplevel(parent)
+    toast = _new_toplevel(parent)
     toast.overrideredirect(True)
     lbl = ttk.Label(toast, text=message, padding=(16, 8), background="#333333",
                     foreground="white", font=("Microsoft YaHei", 9))
@@ -1190,7 +1310,7 @@ def _show_toast(parent: tk.Widget, message: str, duration: int = 2000) -> None:
 
 def _show_warning(parent: tk.Widget, title: str, message: str) -> None:
     """Show warning dialog centered on parent."""
-    dialog = tk.Toplevel(parent)
+    dialog = _new_toplevel(parent)
     dialog.title(title)
     dialog.resizable(True, True)
     dialog.minsize(200, 100)
@@ -1224,7 +1344,7 @@ def _show_error(parent: tk.Widget, title: str, message: str) -> None:
 
 def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
     """Show yes/no confirmation dialog centered on parent. Returns True if Yes."""
-    dialog = tk.Toplevel(parent)
+    dialog = _new_toplevel(parent)
     dialog.title(title)
     dialog.resizable(True, True)
     dialog.minsize(200, 100)
@@ -1265,7 +1385,7 @@ def _ask_yes_no(parent: tk.Widget, title: str, message: str) -> bool:
 
 
 def _show_protocol_help(parent: tk.Widget) -> None:
-    dialog = tk.Toplevel(parent)
+    dialog = _new_toplevel(parent)
     dialog.title("协议说明")
     dialog.configure(bg="#e0e0e0")
     dialog.resizable(True, True)
@@ -1295,7 +1415,7 @@ def _show_protocol_help(parent: tk.Widget) -> None:
 # ── History dialog ────────────────────────────────────────────
 
 
-class HistoryDialog(tk.Toplevel):
+class HistoryDialog(_DialogToplevel):
     """Dialog for viewing capture history."""
 
     def __init__(self, parent: tk.Tk):
@@ -1472,7 +1592,7 @@ class HistoryDialog(tk.Toplevel):
         record = self._get_selected_record()
         if not record:
             return
-        dialog = tk.Toplevel(self)
+        dialog = _new_toplevel(self)
         dialog.title("修改备注")
         dialog.resizable(False, False)
 
@@ -1545,14 +1665,17 @@ class HistoryDialog(tk.Toplevel):
 # ── Playlist dialog ────────────────────────────────────────────
 
 
-class PlaylistDialog(tk.Toplevel):
+class PlaylistDialog(_DialogToplevel):
     """Dialog for viewing and managing the playback queue."""
+
+    DEFAULT_WIDTH, DEFAULT_HEIGHT = 640, 400
+    MIN_WIDTH, MIN_HEIGHT = 540, 320
 
     def __init__(self, parent: tk.Tk):
         super().__init__(parent)
         self.title("播放列表")
         self.resizable(True, True)
-        self.minsize(600, 400)
+        self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.grab_set()
 
         self._parent = parent
@@ -1611,7 +1734,7 @@ class PlaylistDialog(tk.Toplevel):
 
     def _center_on_parent(self) -> None:
         self.update_idletasks()
-        dialog_w, dialog_h = 700, 450
+        dialog_w, dialog_h = self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT
         p = self._parent
         x = p.winfo_x() + (p.winfo_width() - dialog_w) // 2
         y = p.winfo_y() + (p.winfo_height() - dialog_h) // 2
@@ -1700,7 +1823,7 @@ class PlaylistDialog(tk.Toplevel):
         if idx is None or idx < 0 or idx >= len(self._parent._playlist_urls):
             return
         entry = self._parent._playlist_urls[idx]
-        dialog = tk.Toplevel(self)
+        dialog = _new_toplevel(self)
         dialog.title("修改备注")
         dialog.resizable(False, False)
         frm = ttk.Frame(dialog, padding=16)
@@ -1818,7 +1941,7 @@ class PlaylistDialog(tk.Toplevel):
 # ── Record dialog ──────────────────────────────────────────────
 
 
-class RecordDialog(tk.Toplevel):
+class RecordDialog(_DialogToplevel):
     """Dialog for configuring recording settings."""
 
     def __init__(self, parent: tk.Tk, url: str, save_dir: str,
@@ -1895,6 +2018,7 @@ class RecordDialog(tk.Toplevel):
                 break
         self._fmt_combo.pack(fill="x")
         self._fmt_combo.bind("<<ComboboxSelected>>", self._on_format_change)
+        _tame_combobox(self._fmt_combo)
 
         # Duration with wheels
         frm_dur = ttk.LabelFrame(content, text="录制时长", padding=8)
@@ -2097,7 +2221,7 @@ class RecordDialog(tk.Toplevel):
         super().destroy()
 
 
-class PlayerDialog(tk.Toplevel):
+class PlayerDialog(_DialogToplevel):
     """Dialog for managing media players (add/edit/delete)."""
 
     def __init__(self, parent: App, players: dict, on_change: callable):
@@ -2272,7 +2396,7 @@ class PlayerDialog(tk.Toplevel):
         if not path:
             return
 
-        dialog = tk.Toplevel(self)
+        dialog = _new_toplevel(self)
         dialog.title("添加播放器")
         dialog.minsize(420, 0)
         dialog.resizable(True, True)
@@ -2308,7 +2432,7 @@ class PlayerDialog(tk.Toplevel):
                                        values=["auto", "direct", "playlist", "ipc"],
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
-        protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        _tame_combobox(protocol_combo)
 
         ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value="auto")
@@ -2316,7 +2440,7 @@ class PlayerDialog(tk.Toplevel):
                                      values=["auto", "direct", "playlist", "ipc"],
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
-        manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        _tame_combobox(manual_combo)
 
         ttk.Button(dialog, text="协议说明",
                    command=lambda: _show_protocol_help(dialog)
@@ -2397,7 +2521,7 @@ class PlayerDialog(tk.Toplevel):
         old_protocol = _get_player_protocol(old_entry)
         old_manual = _get_player_manual_protocol(old_entry)
 
-        dialog = tk.Toplevel(self)
+        dialog = _new_toplevel(self)
         dialog.title("编辑播放器")
         dialog.minsize(420, 0)
         dialog.resizable(True, True)
@@ -2433,7 +2557,7 @@ class PlayerDialog(tk.Toplevel):
                                        values=["auto", "direct", "playlist", "ipc"],
                                        state="readonly")
         protocol_combo.pack(fill="x", padx=10, pady=(0, 2))
-        protocol_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        _tame_combobox(protocol_combo)
 
         ttk.Label(dialog, text="手动播放协议:").pack(anchor="w", padx=10, pady=(4, 2))
         manual_var = tk.StringVar(value=old_manual)
@@ -2441,7 +2565,7 @@ class PlayerDialog(tk.Toplevel):
                                      values=["auto", "direct", "playlist", "ipc"],
                                      state="readonly")
         manual_combo.pack(fill="x", padx=10, pady=(0, 2))
-        manual_combo.bind("<<ComboboxSelected>>", lambda e: dialog.after(10, dialog.focus_set))
+        _tame_combobox(manual_combo)
 
         ttk.Button(dialog, text="协议说明",
                    command=lambda: _show_protocol_help(dialog)
@@ -2519,7 +2643,7 @@ class ToolTip:
         text = self._text_getter()
         if not text:
             return
-        self._tw = tk.Toplevel(event.widget)
+        self._tw = _new_toplevel(event.widget)
         self._tw.wm_overrideredirect(True)
         self._tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
         lbl = tk.Message(
@@ -2591,7 +2715,7 @@ class TreeviewToolTip:
             self._tw = None
             self._lbl = None
         try:
-            self._tw = tk.Toplevel(self._tv)
+            self._tw = _new_toplevel(self._tv)
             self._tw.wm_overrideredirect(True)
             self._lbl = tk.Message(
                 self._tw, text="", bg="#ffffff", fg="#333",
@@ -2652,7 +2776,7 @@ class ListboxToolTip:
 
     def _show(self, event: tk.Event, text: str) -> None:
         self.hide()
-        self._tw = tk.Toplevel(self._lb)
+        self._tw = _new_toplevel(self._lb)
         self._tw.wm_overrideredirect(True)
         self._tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
         lbl = tk.Message(
@@ -2678,16 +2802,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        try:
-            if getattr(sys, "frozen", False):
-                _base = Path(sys._MEIPASS) / "assets"
-            else:
-                _base = Path(__file__).resolve().parent.parent / "assets"
-            _icon = _base / "icon.ico"
-            if _icon.exists():
-                self.iconbitmap(str(_icon))
-        except Exception:
-            pass
+        _apply_window_icon(self)
         self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.geometry("690x610")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2939,6 +3054,7 @@ class App(tk.Tk):
             self._bind_ip_var.set("自动检测")
         self._net_combo.grid(row=0, column=3, sticky="ew", padx=(4, 0))
         self._net_combo.bind("<<ComboboxSelected>>", lambda e: (self._save_device_settings(), self._net_tt.hide(), self.after(10, self.focus_set)))
+        _tame_combobox(self._net_combo, self._content_canvas)
         self._net_tt = ToolTip(self._net_combo, lambda: self._bind_ip_var.get())
         self._net_combo.bind("<Button-1>", lambda e: self._net_tt.hide(), add="+")
         self._net_combo.bind("<FocusOut>", lambda e: self._net_tt.hide(), add="+")
@@ -3046,7 +3162,7 @@ class App(tk.Tk):
         self._auto_play_combo = ttk.Combobox(row_auto, textvariable=self._auto_play_player_var,
                                               values=player_names, width=20, state="readonly")
         row_auto.add(self._auto_play_combo, padx=(4, 0))
-        self._auto_play_combo.bind("<<ComboboxSelected>>", lambda e: self.after(10, self.focus_set))
+        _tame_combobox(self._auto_play_combo, self._content_canvas)
         row_auto.add(ttk.Checkbutton(row_auto, text="杀旧进程", variable=self._manual_kill_prev_var,
                                      command=self._save_manual_kill_settings), padx=(12, 0))
         row_auto.add(ttk.Checkbutton(row_auto, text="全局直连", variable=self._force_direct_var,
@@ -3056,12 +3172,7 @@ class App(tk.Tk):
         debounce_spin = ttk.Spinbox(row_auto, from_=0.5, to=10.0, increment=0.5,
                                      textvariable=self._debounce_var, width=5)
         row_auto.add(debounce_spin, padx=(0, 4))
-        def _debounce_wheel(event):
-            self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-        debounce_spin.bind("<MouseWheel>", _debounce_wheel)
-        debounce_spin.bind("<Button-4>", _debounce_wheel)
-        debounce_spin.bind("<Button-5>", _debounce_wheel)
+        _bind_wheel_scroll(debounce_spin, self._content_canvas)
         debounce_spin.bind("<FocusOut>", lambda e: self._save_debounce_settings())
         _bind_enter_commit(debounce_spin, self._save_debounce_settings)
 
@@ -4033,7 +4144,7 @@ class App(tk.Tk):
         if not url:
             _show_toast(self, "请先捕获 URL")
             return
-        dialog = tk.Toplevel(self)
+        dialog = _new_toplevel(self)
         dialog.title("编辑备注")
         dialog.resizable(False, False)
         frm = ttk.Frame(dialog, padding=16)
@@ -4270,7 +4381,7 @@ class App(tk.Tk):
             mode = "history"
 
         # Custom confirmation dialog centered on main window
-        dialog = tk.Toplevel(self)
+        dialog = _new_toplevel(self)
         dialog.title("确认")
         dialog.resizable(False, False)
         dialog.grab_set()
