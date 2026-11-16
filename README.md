@@ -251,7 +251,7 @@ screen-mirroring-capture/
 ├── run.py                  # PyInstaller 打包入口
 ├── run.bat                 # Windows 快速启动（自动建 venv）
 ├── launch.vbs              # Windows 静默启动（无控制台窗口）
-├── CHANGELOG.md            # 版本更新日志
+├── CHANGELOG.md            # 版本更新日志（本地维护，不入库）
 ├── COMMANDS.md             # CLI / 构建命令速查
 ├── LICENSE                 # GPL-3.0 许可证
 └── README.md               # 项目说明
@@ -278,7 +278,7 @@ screen-mirroring-capture 通过以下方式工作：
 
 ## 更新日志
 
-完整变更记录见 [CHANGELOG.md](CHANGELOG.md)，按版本给出「修改前 / 修改后」对照。
+完整变更记录见 [Releases](https://github.com/Muchen0x/screen-mirroring-capture/releases) 页面的 Release 说明，按版本给出「修改前 / 修改后」对照。
 
 - **v1.7.0**（2026-11-16）：新增单实例守卫，重复启动会唤醒已有窗口而不再多开；修复连续捕获恒为空、端口非法即失效、AirPlay 音频未接通等 P0 问题；SSDP 通告降频约 150 倍、UPnP 描述 XML 转义、播放器进程回收等稳定性改进；界面改为自动换行，窗口缩放耗时从 371ms 降到 82ms；捕获控制行重排，开始/停止合并为一个按钮；下拉框不再被滚轮改值、点击后不留虚线焦点框；所有子窗口统一应用图标。
 - **v1.6.0**（2026-08-29）：自动播放行为重构；UI 线程改为队列派发，修复全线程冻结；修复 ffplay 统计流导致的日志卡死；录制支持任意 URL 并改进 ffmpeg/ffprobe 探测。
